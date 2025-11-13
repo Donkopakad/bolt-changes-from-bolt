@@ -1,13 +1,9 @@
 const std = @import("std");
 
+// ===== constants / types you already had (kept) =====
 pub const MAX_ORDERBOOK_SIZE = 5;
 
-//////////////////////////////////////////////////////////
-pub const SignalType = enum {
-    BUY,
-    SELL,
-    HOLD,
-};
+pub const SignalType = enum { BUY, SELL, HOLD };
 
 pub const TradingSignal = struct {
     symbol_name: []const u8,
@@ -16,6 +12,7 @@ pub const TradingSignal = struct {
     orderbook_percentage: f32,
     timestamp: i128,
     signal_strength: f32,
+    leverage: f32,
 };
 
 pub const Position = struct {
@@ -26,7 +23,6 @@ pub const Position = struct {
     signal_strength: f32,
 };
 
-//////////////////////////////////////////////////////////
 pub const MAX_SYMBOLS_CUDA = 404;
 pub const MAX_SYMBOLS = MAX_SYMBOLS_CUDA;
 pub const MAX_RSI_VALUES_PER_SYMBOL = 15;
@@ -36,6 +32,11 @@ pub const DeviceInfo = extern struct {
     major: c_int,
     minor: c_int,
     totalGlobalMem: usize,
+};
+
+pub const GPUOHLCDataBatch = extern struct {
+    close_prices: [MAX_SYMBOLS][15]f32,
+    counts: [MAX_SYMBOLS]u32,
 };
 
 pub const GPUOHLCDataBatch = extern struct {

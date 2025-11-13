@@ -116,6 +116,12 @@ pub const SignalEngine = struct {
     tasks_completed: std.atomic.Value(u64),
     total_processing_time: std.atomic.Value(u64),
 
+    csv_file_path: []const u8,
+    csv_file_position: u64,
+    csv_header_processed: bool,
+    csv_missing_warned: bool,
+    symbol_name_cache: std.StringHashMap([]const u8),
+
     pub fn init(allocator: std.mem.Allocator, symbol_map: *const SymbolMap) !SignalEngine {
         const device_id = try stat_calc_lib.selectBestCUDADevice();
         var stat_calc = try allocator.create(StatCalc);
@@ -151,6 +157,11 @@ pub const SignalEngine = struct {
             .signal_queue = SignalQueue.init(allocator),
             .tasks_completed = std.atomic.Value(u64).init(0),
             .total_processing_time = std.atomic.Value(u64).init(0),
+            .csv_file_path = "percent_changes_15m.csv",
+            .csv_file_position = 0,
+            .csv_header_processed = false,
+            .csv_missing_warned = false,
+            .symbol_name_cache = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -175,6 +186,7 @@ pub const SignalEngine = struct {
         self.task_queue.deinit();
         self.signal_queue.deinit();
         self.allocator.free(self.worker_threads);
+        self.freeSymbolCache();
 
         if (self.stat_calc) |stat_calc| {
             stat_calc.deinit();
@@ -200,84 +212,7 @@ pub const SignalEngine = struct {
         for (0..self.num_worker_threads) |i| {
             self.worker_threads[i] = try std.Thread.spawn(.{ .allocator = self.allocator }, workerThreadFunction, .{ self, i });
         }
-        std.log.info("Started {} worker threads", .{self.num_worker_threads});
-    }
-
-    fn workerThreadFunction(self: *SignalEngine, worker_id: usize) !void {
-        std.log.info("Worker thread {} started", .{worker_id});
-
-        var local_signals = std.ArrayList(TradingSignal).init(self.allocator);
-        defer local_signals.deinit();
-
-        while (!self.should_stop.load(.seq_cst)) {
-            self.task_queue_mutex.lock();
-
-            while (self.task_queue.items.len == 0 and !self.should_stop.load(.seq_cst)) {
-                self.task_condition.wait(&self.task_queue_mutex);
-            }
-
-            if (self.should_stop.load(.seq_cst)) {
-                self.task_queue_mutex.unlock();
-                break;
-            }
-
-            const task = self.task_queue.orderedRemove(0);
-            self.task_queue_mutex.unlock();
-
-            const start_time = std.time.nanoTimestamp();
-            local_signals.clearRetainingCapacity();
-
-            self.processTaskChunk(task, &local_signals) catch |err| {
-                std.log.err("Worker {} error processing task {}: {}", .{ worker_id, task.task_id, err });
-            };
-
-            // add all collected signals to the shared queue in one atomic operation
-            self.signal_queue.addSlice(local_signals.items) catch |err| {
-                std.log.err("Worker {} failed to add signals to queue: {}", .{ worker_id, err });
-            };
-
-            const end_time = std.time.nanoTimestamp();
-            _ = self.tasks_completed.fetchAdd(1, .seq_cst);
-            _ = self.total_processing_time.fetchAdd(@as(u64, @intCast(end_time - start_time)), .seq_cst);
-
-            // signal to the main processing thread that this task is complete
-            self.tasks_finished_sem.post();
-        }
-
-        std.log.info("Worker thread {} stopped", .{worker_id});
-    }
-
-    pub fn startBatchThread(self: *SignalEngine) !void {
-        self.batch_thread = try std.Thread.spawn(.{ .allocator = self.allocator }, batchThreadFunction, .{self});
-    }
-
-    fn batchThreadFunction(self: *SignalEngine) void {
-        std.log.info("Batch processing thread started", .{});
-
-        while (!self.should_stop.load(.seq_cst)) {
-            const batch_results = self.stat_calc.?.calculateSymbolMapBatch(self.symbol_map, 14) catch |err| {
-                std.log.err("Error calculating batch: {}", .{err});
-                std.time.sleep(1_000_000_000); // 1s
-                continue;
-            };
-
-            self.batch_queue_mutex.lock();
-            self.batch_result_queue.append(batch_results) catch |err| {
-                std.log.err("Error queuing batch result: {}", .{err});
-            };
-            self.batch_queue_mutex.unlock();
-
-            self.batch_condition.signal();
-            std.time.sleep(10_000_000); // 10ms
-        }
-
-        std.log.info("Batch processing thread stopped", .{});
-    }
-
-    pub fn startProcessingThread(self: *SignalEngine) !void {
-        self.processing_thread = try std.Thread.spawn(.{ .allocator = self.allocator }, processingThreadFunction, .{self});
-    }
-
+@@ -281,144 +293,209 @@ pub const SignalEngine = struct {
     fn processingThreadFunction(self: *SignalEngine) void {
         std.log.info("Signal processing thread started", .{});
 
@@ -303,58 +238,8 @@ pub const SignalEngine = struct {
     }
 
     fn processSignalsParallel(self: *SignalEngine, pct_results: *GPUPercentageChangeResultBatch) !void {
-        const num_symbols = @min(self.symbol_map.count(), MAX_SYMBOLS);
-        if (num_symbols == 0) return;
-
-        const symbol_names = try self.allocator.alloc([]const u8, num_symbols);
-        defer self.allocator.free(symbol_names);
-
-        const percentage_changes = try self.allocator.alloc(f64, num_symbols);
-        defer self.allocator.free(percentage_changes);
-
-        const has_positions = try self.allocator.alloc(bool, num_symbols);
-        defer self.allocator.free(has_positions);
-
-        self.mutex.lock();
-        var symbol_idx: usize = 0;
-        var iterator = self.symbol_map.iterator();
-        while (iterator.next()) |entry| {
-            if (symbol_idx >= num_symbols) break;
-            symbol_names[symbol_idx] = entry.key_ptr.*;
-            const symbol = entry.value_ptr.*;
-
-            percentage_changes[symbol_idx] = symbol.getPercentageChange();
-            has_positions[symbol_idx] = self.trade_handler.hasOpenPosition(symbol_names[symbol_idx]);
-            symbol_idx += 1;
-        }
-        self.mutex.unlock();
-
-        for (0..num_symbols) |i| {
-            const pct_change = @as(f32, @floatCast(percentage_changes[i]));
-            const has_position = has_positions[i];
-
-            if (pct_change < -1.0 and !has_position) {
-                const signal = TradingSignal{
-                    .symbol_name = symbol_names[i],
-                    .signal_type = .BUY,
-                    .rsi_value = pct_change,
-                    .orderbook_percentage = pct_change,
-                    .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
-                    .signal_strength = @min(1.0, @abs(pct_change) / 5.0),
-                };
-                try self.trade_handler.addSignal(signal);
-            } else if (pct_change > 1.0 and has_position) {
-                const signal = TradingSignal{
-                    .symbol_name = symbol_names[i],
-                    .signal_type = .SELL,
-                    .rsi_value = pct_change,
-                    .orderbook_percentage = pct_change,
-                    .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
-                    .signal_strength = @min(1.0, pct_change / 5.0),
-                };
-                try self.trade_handler.addSignal(signal);
-            }
-        }
+        _ = pct_results;
+        try self.generateSignalsFromCsv();
     }
 
     fn processTaskChunk(_: *SignalEngine, task: ProcessingTask, out_signals: *std.ArrayList(TradingSignal)) !void {
@@ -391,6 +276,7 @@ pub const SignalEngine = struct {
                     .orderbook_percentage = task.bid_percentages[i],
                     .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
                     .signal_strength = decision.signal_strength,
+                    .leverage = 1.0,
                 });
             }
 
@@ -402,8 +288,137 @@ pub const SignalEngine = struct {
                     .orderbook_percentage = task.ask_percentages[i],
                     .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
                     .signal_strength = decision.signal_strength,
+                    .leverage = 1.0,
                 });
             }
         }
+    }
+
+    fn generateSignalsFromCsv(self: *SignalEngine) !void {
+        var file = std.fs.cwd().openFile(self.csv_file_path, .{ .mode = .read_only }) catch |err| {
+            if (err == error.FileNotFound) {
+                if (!self.csv_missing_warned) {
+                    self.csv_missing_warned = true;
+                    std.log.warn("CSV file {s} not found; waiting for aggregator to create it", .{ self.csv_file_path });
+                }
+                return;
+            }
+            return err;
+        };
+        defer file.close();
+
+        const stat = try file.stat();
+        if (stat.size < self.csv_file_position) {
+            self.csv_file_position = 0;
+            self.csv_header_processed = false;
+        }
+
+        if (stat.size == self.csv_file_position) {
+            return;
+        }
+
+        try file.seekTo(self.csv_file_position);
+        const remaining = stat.size - self.csv_file_position;
+        if (remaining == 0) return;
+
+        var buffer = try self.allocator.alloc(u8, remaining);
+        defer self.allocator.free(buffer);
+        const bytes_read = try file.readAll(buffer);
+        self.csv_file_position += bytes_read;
+
+        var header_seen = self.csv_header_processed;
+        var it = std.mem.splitScalar(u8, buffer[0..bytes_read], '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trimRight(u8, line_raw, "\r");
+            if (line.len == 0) continue;
+            if (!header_seen) {
+                header_seen = true;
+                if (std.mem.startsWith(u8, line, "timestamp_ms")) {
+                    continue;
+                }
+            }
+
+            self.handleCsvLine(line) catch |err| {
+                std.log.warn("Failed to handle CSV line: {}", .{err});
+            };
+        }
+
+        self.csv_header_processed = header_seen;
+    }
+
+    fn handleCsvLine(self: *SignalEngine, line: []const u8) !void {
+        var parts = std.mem.splitScalar(u8, line, ',');
+        _ = parts.next() orelse return; // timestamp
+        const symbol_slice = parts.next() orelse return;
+        _ = parts.next(); // open
+        _ = parts.next(); // last
+        const pct_slice = parts.next() orelse return;
+
+        if (pct_slice.len == 0) return;
+
+        const pct_change = std.fmt.parseFloat(f32, pct_slice) catch {
+            return;
+        };
+
+        const symbol_name = try self.internSymbolName(symbol_slice);
+        try self.evaluateCsvSignal(symbol_name, pct_change);
+    }
+
+    fn internSymbolName(self: *SignalEngine, raw_name: []const u8) ![]const u8 {
+        if (self.symbol_name_cache.get(raw_name)) |existing| {
+            return existing;
+        }
+
+        const duped = try self.allocator.dupe(u8, raw_name);
+        const gop = try self.symbol_name_cache.getOrPut(duped);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = duped;
+            gop.value_ptr.* = duped;
+            return duped;
+        } else {
+            self.allocator.free(duped);
+            return gop.value_ptr.*;
+        }
+    }
+
+    fn evaluateCsvSignal(self: *SignalEngine, symbol_name: []const u8, pct_change: f32) !void {
+        const positive_threshold: f32 = 5.0;
+        const negative_threshold: f32 = -5.0;
+        const default_leverage: f32 = 1.0;
+        const magnitude = @abs(pct_change);
+        const strength = if (magnitude == 0.0) 0.5 else @min(1.0, magnitude / 20.0);
+        const side = self.trade_handler.getPositionSide(symbol_name);
+
+        if (pct_change >= positive_threshold and side != .long) {
+            const signal = TradingSignal{
+                .symbol_name = symbol_name,
+                .signal_type = .BUY,
+                .rsi_value = pct_change,
+                .orderbook_percentage = pct_change,
+                .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
+                .signal_strength = strength,
+                .leverage = default_leverage,
+            };
+            try self.trade_handler.addSignal(signal);
+        } else if (pct_change <= negative_threshold and side != .short) {
+            const signal = TradingSignal{
+                .symbol_name = symbol_name,
+                .signal_type = .SELL,
+                .rsi_value = pct_change,
+                .orderbook_percentage = pct_change,
+                .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
+                .signal_strength = strength,
+                .leverage = default_leverage,
+            };
+            try self.trade_handler.addSignal(signal);
+        }
+    }
+
+    fn freeSymbolCache(self: *SignalEngine) void {
+        var it = self.symbol_name_cache.keyIterator();
+        while (it.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.symbol_name_cache.deinit();
     }
 };

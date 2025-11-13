@@ -1,9 +1,10 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const SymbolMap = @import("../symbol-map.zig").SymbolMap;
-const PortfolioManager = @import("portfolio_manager.zig").PortfolioManager;
+const portfolio_manager = @import("portfolio_manager.zig");
+const PortfolioManager = portfolio_manager.PortfolioManager;
+const PositionSide = portfolio_manager.PositionSide;
 const TradingSignal = types.TradingSignal;
-const Position = types.Position;
 const SignalType = types.SignalType;
 
 pub const TradeHandler = struct {
@@ -29,9 +30,7 @@ pub const TradeHandler = struct {
             .portfolio_manager = PortfolioManager.init(allocator, symbol_map),
 
             .high_strength_sell = std.ArrayList(TradingSignal).init(allocator),
-            .high_strength_buy = std.ArrayList(TradingSignal).init(allocator),
-            .low_strength_sell = std.ArrayList(TradingSignal).init(allocator),
-            .low_strength_buy = std.ArrayList(TradingSignal).init(allocator),
+@@ -35,79 +36,81 @@ pub const TradeHandler = struct {
         };
     }
 
@@ -57,10 +56,11 @@ pub const TradeHandler = struct {
         defer self.mutex.unlock();
 
         const is_high = signal.signal_strength > 0.9;
+        const side = self.portfolio_manager.getPositionSide(signal.symbol_name);
 
         switch (signal.signal_type) {
             .SELL => {
-                if (self.hasOpenPosition(signal.symbol_name)) {
+                if (side != .short) {
                     if (is_high) {
                         try self.high_strength_sell.append(signal);
                     } else {
@@ -69,7 +69,7 @@ pub const TradeHandler = struct {
                 }
             },
             .BUY => {
-                if (!self.hasOpenPosition(signal.symbol_name)) {
+                if (side != .long) {
                     if (is_high) {
                         try self.high_strength_buy.append(signal);
                     } else {
@@ -82,10 +82,11 @@ pub const TradeHandler = struct {
     }
 
     pub inline fn hasOpenPosition(self: *TradeHandler, symbol_name: []const u8) bool {
-        if (self.portfolio_manager.positions.get(symbol_name)) |position| {
-            return position.is_open;
-        }
-        return false;
+        return self.portfolio_manager.getPositionSide(symbol_name) != .none;
+    }
+
+    pub inline fn getPositionSide(self: *TradeHandler, symbol_name: []const u8) PositionSide {
+        return self.portfolio_manager.getPositionSide(symbol_name);
     }
 
     pub fn getOpenPositionsCount(self: *TradeHandler) usize {
@@ -110,7 +111,7 @@ pub const TradeHandler = struct {
         while (!self.should_stop.load(.seq_cst)) {
             self.mutex.lock();
             const queues = &[_]*std.ArrayList(TradingSignal){
-                &self.high_strength_sell,
+                &self.high_strength_sell,                          
                 &self.high_strength_buy,
                 &self.low_strength_sell,
                 &self.low_strength_buy,
