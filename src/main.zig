@@ -28,10 +28,10 @@ pub fn main() !void {
     var aggregator = try DataAggregator.init(enable_metrics, smp_allocator);
     defer aggregator.deinit();
 
-    var csv_stop_flag = AtomicBool.init(true);
-    const csv_thread = try std.Thread.spawn(.{}, csv_generator.run, .{&csv_stop_flag});
+    var run_flag = AtomicBool.init(true);
+    const csv_thread = try std.Thread.spawn(.{}, csv_generator.run, .{&run_flag});
     defer {
-        csv_stop_flag.store(false, .SeqCst);
+        run_flag.store(false, .SeqCst);
         csv_thread.join();
     }
 
@@ -43,17 +43,10 @@ pub fn main() !void {
 
     std.debug.print("WebSockets flowing, starting continuous Signal Engine and Trading...\n", .{});
 
-    const max_duration_ns = 180 * 60 * 1_000_000_000; // 180 min
-    const warm_up_duration_ns = 10 * 60 * 1_000_000_000; // 10 min
-
-    std.time.sleep(warm_up_duration_ns);
-    std.log.info("Warm-up complete, starting signal engine...", .{});
     try signal_engine.run();
 
-    const remaining_time = max_duration_ns - warm_up_duration_ns;
-    std.time.sleep(remaining_time);
-
-    std.log.info("Reached 180-minute limit, stopping...", .{});
-    // TODO: SELL ALL TRADES
+    std.log.info("Trading system is running continuously. Press Ctrl+C to terminate.", .{});
+    while (run_flag.load(.SeqCst)) {
+        std.time.sleep(std.time.ns_per_s);
+    }
 }
-
