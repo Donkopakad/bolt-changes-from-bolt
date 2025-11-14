@@ -121,7 +121,7 @@ pub const LockFreeRingBuffer = struct {
             const current_head = self.head.load(.acquire);
             const current_tail = self.tail.load(.acquire);
 
-            if (current_head == current_tail) {
+           if (current_head == current_tail) {
                 return null;
             }
 
@@ -145,7 +145,7 @@ pub const LockFreeRingBuffer = struct {
 pub const MetricsChannel = struct {
     allocator: std.mem.Allocator,
     ring_buffer: SimpleLockFreeRingBuffer,
-    should_stop: std.atomic.Value(bool),
+    run_flag: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator) !*MetricsChannel {
         const channel = try allocator.create(MetricsChannel);
@@ -154,7 +154,7 @@ pub const MetricsChannel = struct {
         channel.* = MetricsChannel{
             .allocator = allocator,
             .ring_buffer = ring_buffer,
-            .should_stop = std.atomic.Value(bool).init(false),
+            .run_flag = std.atomic.Value(bool).init(true),
         };
         return channel;
     }
@@ -173,11 +173,11 @@ pub const MetricsChannel = struct {
     }
 
     pub fn stop(self: *MetricsChannel) void {
-        self.should_stop.store(true, .release);
+        self.run_flag.store(false, .release);
     }
 
-    pub fn shouldStop(self: *MetricsChannel) bool {
-        return self.should_stop.load(.acquire);
+    pub fn isRunning(self: *MetricsChannel) bool {
+        return self.run_flag.load(.acquire);
     }
 
     pub fn hasData(self: *MetricsChannel) bool {
@@ -203,44 +203,7 @@ pub const MetricsCollector = struct {
     pub fn recordDepthMessage(self: *MetricsCollector, duration_us: f64) void {
         _ = self.depth_msg_count.fetchAdd(1, .acq_rel);
 
-        const duration_metric = MetricData{
-            .metric_type = .depth_handler_duration,
-            .value = duration_us,
-            .timestamp = std.time.milliTimestamp(),
-        };
-        _ = self.channel.send(duration_metric);
-
-        self.checkAndResetCounters();
-    }
-
-    pub fn recordTickerMessage(self: *MetricsCollector, duration_us: f64) void {
-        _ = self.ticker_msg_count.fetchAdd(1, .acq_rel);
-
-        const duration_metric = MetricData{
-            .metric_type = .ticker_handler_duration,
-            .value = duration_us,
-            .timestamp = std.time.milliTimestamp(),
-        };
-        _ = self.channel.send(duration_metric);
-
-        self.checkAndResetCounters();
-    }
-
-    fn checkAndResetCounters(self: *MetricsCollector) void {
-        const current_time = std.time.milliTimestamp();
-        const last_reset = self.last_reset_time.load(.acquire);
-        const elapsed_ms = current_time - last_reset;
-
-        if (elapsed_ms >= 1000) {
-            // try to atomically update the reset time to avoid multiple threads doing this
-            if (self.last_reset_time.cmpxchgWeak(last_reset, current_time, .acq_rel, .acquire) == null) {
-                const depth_count = self.depth_msg_count.swap(0, .acq_rel);
-                const ticker_count = self.ticker_msg_count.swap(0, .acq_rel);
-
-                const actual_elapsed_ms = current_time - last_reset;
-                const elapsed_seconds = @as(f64, @floatFromInt(actual_elapsed_ms)) / 1000.0;
-
-                if (depth_count > 0) {
+@@ -244,50 +244,50 @@ pub const MetricsCollector = struct {
                     const depth_rate = @as(f64, @floatFromInt(depth_count)) / elapsed_seconds;
                     const depth_metric = MetricData{
                         .metric_type = .depth_handler_msg,
@@ -266,7 +229,7 @@ pub const MetricsCollector = struct {
 
 pub fn metricsThread(channel: *MetricsChannel) void {
     std.debug.print("Metrics thread started\n", .{});
-    while (!channel.shouldStop()) {
+    while (channel.isRunning()) {
         while (channel.receive()) |metric| {
             switch (metric.metric_type) {
                 .depth_handler_msg => {
