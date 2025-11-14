@@ -74,177 +74,351 @@ const SignalQueue = struct {
 
     // add a whole slice of signals under a single lock
     pub fn addSlice(self: *SignalQueue, new_signals: []const TradingSignal) !void {
+        
+@@ -77,173 +77,173 @@ const SignalQueue = struct {
+        if (new_signals.len == 0) return;
         if (new_signals.len == 0) return;
         self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.signals.appendSlice(new_signals);
-    }
-
-    pub fn drainAll(self: *SignalQueue, out_signals: *std.ArrayList(TradingSignal)) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        defer self.mutex.unlock();
+        try self.signals.appendSlice(new_signals);
+        try self.signals.appendSlice(new_signals);
+    }
+    }
+
+
+    pub fn drainAll(self: *SignalQueue, out_signals: *std.ArrayList(TradingSignal)) !void {
+    pub fn drainAll(self: *SignalQueue, out_signals: *std.ArrayList(TradingSignal)) !void {
+        self.mutex.lock();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        defer self.mutex.unlock();
+
 
         try out_signals.appendSlice(self.signals.items);
+        try out_signals.appendSlice(self.signals.items);
+        self.signals.clearRetainingCapacity();
         self.signals.clearRetainingCapacity();
     }
+    }
+};
 };
 
+
+pub const SignalEngine = struct {
 pub const SignalEngine = struct {
     allocator: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    symbol_map: *const SymbolMap,
     symbol_map: *const SymbolMap,
     stat_calc: ?*StatCalc = null,
+    stat_calc: ?*StatCalc = null,
+    trade_handler: TradeHandler,
     trade_handler: TradeHandler,
 
+
+    processing_thread: ?std.Thread,
     processing_thread: ?std.Thread,
     batch_thread: ?std.Thread,
+    batch_thread: ?std.Thread,
+    worker_threads: []std.Thread,
     worker_threads: []std.Thread,
     num_worker_threads: u32,
+    num_worker_threads: u32,
     should_stop: std.atomic.Value(bool),
+    run_flag: std.atomic.Value(bool),
+    mutex: std.Thread.Mutex,
     mutex: std.Thread.Mutex,
 
+
+    batch_result_queue: std.ArrayList(GPUBatchResult),
     batch_result_queue: std.ArrayList(GPUBatchResult),
     batch_queue_mutex: std.Thread.Mutex,
+    batch_queue_mutex: std.Thread.Mutex,
+    batch_condition: std.Thread.Condition,
     batch_condition: std.Thread.Condition,
 
+
+    task_queue: std.ArrayList(ProcessingTask),
     task_queue: std.ArrayList(ProcessingTask),
     task_queue_mutex: std.Thread.Mutex,
+    task_queue_mutex: std.Thread.Mutex,
+    task_condition: std.Thread.Condition,
     task_condition: std.Thread.Condition,
     tasks_finished_sem: std.Thread.Semaphore,
+    tasks_finished_sem: std.Thread.Semaphore,
+
 
     signal_queue: SignalQueue,
+    signal_queue: SignalQueue,
+
 
     tasks_completed: std.atomic.Value(u64),
+    tasks_completed: std.atomic.Value(u64),
+    total_processing_time: std.atomic.Value(u64),
     total_processing_time: std.atomic.Value(u64),
 
+
+    csv_file_path: []const u8,
     csv_file_path: []const u8,
     csv_file_position: u64,
+    csv_file_position: u64,
+    csv_header_processed: bool,
     csv_header_processed: bool,
     csv_missing_warned: bool,
+    csv_missing_warned: bool,
+    symbol_name_cache: std.StringHashMap([]const u8),
     symbol_name_cache: std.StringHashMap([]const u8),
 
+
+    pub fn init(allocator: std.mem.Allocator, symbol_map: *const SymbolMap) !SignalEngine {
     pub fn init(allocator: std.mem.Allocator, symbol_map: *const SymbolMap) !SignalEngine {
         const device_id = try stat_calc_lib.selectBestCUDADevice();
+        const device_id = try stat_calc_lib.selectBestCUDADevice();
+        var stat_calc = try allocator.create(StatCalc);
         var stat_calc = try allocator.create(StatCalc);
         stat_calc.* = try StatCalc.init(allocator, device_id);
+        stat_calc.* = try StatCalc.init(allocator, device_id);
+        try stat_calc.getDeviceInfo();
         try stat_calc.getDeviceInfo();
         try stat_calc.warmUp();
+        try stat_calc.warmUp();
+
 
         const trade_handler = TradeHandler.init(allocator, symbol_map);
+        const trade_handler = TradeHandler.init(allocator, symbol_map);
+
 
         const cpu_count = (std.Thread.getCpuCount() catch 8) / 2; // hyper threading cores wont count
+        const cpu_count = (std.Thread.getCpuCount() catch 8) / 2; // hyper threading cores wont count
+        const num_workers = @max(2, cpu_count - 2);
         const num_workers = @max(2, cpu_count - 2);
 
+
+        const worker_threads = try allocator.alloc(std.Thread, num_workers);
         const worker_threads = try allocator.alloc(std.Thread, num_workers);
 
+
+        return SignalEngine{
         return SignalEngine{
             .allocator = allocator,
+            .allocator = allocator,
+            .symbol_map = symbol_map,
             .symbol_map = symbol_map,
             .stat_calc = stat_calc,
+            .stat_calc = stat_calc,
+            .trade_handler = trade_handler,
             .trade_handler = trade_handler,
             .processing_thread = null,
+            .processing_thread = null,
+            .batch_thread = null,
             .batch_thread = null,
             .worker_threads = worker_threads,
+            .worker_threads = worker_threads,
+            .num_worker_threads = @intCast(num_workers),
             .num_worker_threads = @intCast(num_workers),
             .should_stop = std.atomic.Value(bool).init(false),
+            .run_flag = std.atomic.Value(bool).init(true),
+            .mutex = std.Thread.Mutex{},
             .mutex = std.Thread.Mutex{},
             .batch_result_queue = std.ArrayList(GPUBatchResult).init(allocator),
+            .batch_result_queue = std.ArrayList(GPUBatchResult).init(allocator),
+            .batch_queue_mutex = std.Thread.Mutex{},
             .batch_queue_mutex = std.Thread.Mutex{},
             .batch_condition = std.Thread.Condition{},
+            .batch_condition = std.Thread.Condition{},
+            .task_queue = std.ArrayList(ProcessingTask).init(allocator),
             .task_queue = std.ArrayList(ProcessingTask).init(allocator),
             .task_queue_mutex = std.Thread.Mutex{},
+            .task_queue_mutex = std.Thread.Mutex{},
+            .task_condition = std.Thread.Condition{},
             .task_condition = std.Thread.Condition{},
             .tasks_finished_sem = std.Thread.Semaphore{},
+            .tasks_finished_sem = std.Thread.Semaphore{},
+            .signal_queue = SignalQueue.init(allocator),
             .signal_queue = SignalQueue.init(allocator),
             .tasks_completed = std.atomic.Value(u64).init(0),
+            .tasks_completed = std.atomic.Value(u64).init(0),
+            .total_processing_time = std.atomic.Value(u64).init(0),
             .total_processing_time = std.atomic.Value(u64).init(0),
             .csv_file_path = "percent_changes_15m.csv",
+            .csv_file_path = "percent_changes_15m.csv",
+            .csv_file_position = 0,
             .csv_file_position = 0,
             .csv_header_processed = false,
+            .csv_header_processed = false,
+            .csv_missing_warned = false,
             .csv_missing_warned = false,
             .symbol_name_cache = std.StringHashMap([]const u8).init(allocator),
+            .symbol_name_cache = std.StringHashMap([]const u8).init(allocator),
+        };
         };
     }
+    }
+
 
     pub fn deinit(self: *SignalEngine) void {
+    pub fn deinit(self: *SignalEngine) void {
         self.should_stop.store(true, .seq_cst);
+        self.run_flag.store(false, .seq_cst);
+        self.batch_condition.signal();
         self.batch_condition.signal();
         self.task_condition.broadcast();
+        self.task_condition.broadcast();
+
 
         if (self.processing_thread) |thread| {
+        if (self.processing_thread) |thread| {
             thread.join();
+            thread.join();
+        }
         }
         if (self.batch_thread) |thread| {
+        if (self.batch_thread) |thread| {
+            thread.join();
             thread.join();
         }
+        }
+
 
         for (self.worker_threads) |thread| {
+        for (self.worker_threads) |thread| {
+            thread.join();
             thread.join();
         }
+        }
+
 
         self.trade_handler.deinit();
+        self.trade_handler.deinit();
+        self.batch_result_queue.deinit();
         self.batch_result_queue.deinit();
         self.task_queue.deinit();
+        self.task_queue.deinit();
+        self.signal_queue.deinit();
         self.signal_queue.deinit();
         self.allocator.free(self.worker_threads);
+        self.allocator.free(self.worker_threads);
+        self.freeSymbolCache();
         self.freeSymbolCache();
 
+
+        if (self.stat_calc) |stat_calc| {
         if (self.stat_calc) |stat_calc| {
             stat_calc.deinit();
+            stat_calc.deinit();
+            self.allocator.destroy(stat_calc);
             self.allocator.destroy(stat_calc);
         }
+        }
+
 
         const completed = self.tasks_completed.load(.seq_cst);
+        const completed = self.tasks_completed.load(.seq_cst);
+        const total_time = self.total_processing_time.load(.seq_cst);
         const total_time = self.total_processing_time.load(.seq_cst);
         if (completed > 0) {
+        if (completed > 0) {
+            const avg_time_ns = total_time / completed;
             const avg_time_ns = total_time / completed;
             std.log.info("Performance: {} tasks completed, avg time: {d:.3}us", .{ completed, @as(f64, @floatFromInt(avg_time_ns)) / 1000.0 });
+            std.log.info("Performance: {} tasks completed, avg time: {d:.3}us", .{ completed, @as(f64, @floatFromInt(avg_time_ns)) / 1000.0 });
+        }
         }
     }
+    }
+
 
     pub fn run(self: *SignalEngine) !void {
+    pub fn run(self: *SignalEngine) !void {
+        try self.startWorkerThreads();
         try self.startWorkerThreads();
         try self.startProcessingThread();
+        try self.startProcessingThread();
+        try self.trade_handler.start();
         try self.trade_handler.start();
         try self.startBatchThread();
+        try self.startBatchThread();
     }
+    }
+
 
     fn startWorkerThreads(self: *SignalEngine) !void {
+    fn startWorkerThreads(self: *SignalEngine) !void {
+        for (0..self.num_worker_threads) |i| {
         for (0..self.num_worker_threads) |i| {
             self.worker_threads[i] = try std.Thread.spawn(.{ .allocator = self.allocator }, workerThreadFunction, .{ self, i });
+            self.worker_threads[i] = try std.Thread.spawn(.{ .allocator = self.allocator }, workerThreadFunction, .{ self, i });
+        }
         }
 @@ -281,144 +293,209 @@ pub const SignalEngine = struct {
+@@ -281,144 +293,209 @@ pub const SignalEngine = struct {
+    fn processingThreadFunction(self: *SignalEngine) void {
     fn processingThreadFunction(self: *SignalEngine) void {
         std.log.info("Signal processing thread started", .{});
+        std.log.info("Signal processing thread started", .{});
+
 
         while (!self.should_stop.load(.seq_cst)) {
+        while (self.run_flag.load(.seq_cst)) {
+            self.batch_queue_mutex.lock();
             self.batch_queue_mutex.lock();
             while (self.batch_result_queue.items.len == 0 and !self.should_stop.load(.seq_cst)) {
+            while (self.batch_result_queue.items.len == 0 and self.run_flag.load(.seq_cst)) {
+                self.batch_condition.wait(&self.batch_queue_mutex);
                 self.batch_condition.wait(&self.batch_queue_mutex);
             }
+            }
             if (self.should_stop.load(.seq_cst)) {
+            if (!self.run_flag.load(.seq_cst)) {
+                self.batch_queue_mutex.unlock();
                 self.batch_queue_mutex.unlock();
                 break;
+                break;
+            }
             }
 
+
+            var batch_result = self.batch_result_queue.orderedRemove(0);
             var batch_result = self.batch_result_queue.orderedRemove(0);
             self.batch_queue_mutex.unlock();
+            self.batch_queue_mutex.unlock();
+
 
             self.processSignalsParallel(&batch_result.percentage_change) catch |err| {
+            self.processSignalsParallel(&batch_result.percentage_change) catch |err| {
+                std.log.err("Error processing signals: {}", .{err});
                 std.log.err("Error processing signals: {}", .{err});
             };
+            };
+        }
         }
 
+
+        std.log.info("Signal processing thread stopped", .{});
         std.log.info("Signal processing thread stopped", .{});
     }
-
-    fn processSignalsParallel(self: *SignalEngine, pct_results: *GPUPercentageChangeResultBatch) !void {
-        _ = pct_results;
-        try self.generateSignalsFromCsv();
     }
 
+
+    fn processSignalsParallel(self: *SignalEngine, pct_results: *GPUPercentageChangeResultBatch) !void {
+    fn processSignalsParallel(self: *SignalEngine, pct_results: *GPUPercentageChangeResultBatch) !void {
+        _ = pct_results;
+        _ = pct_results;
+        try self.generateSignalsFromCsv();
+        try self.generateSignalsFromCsv();
+    }
+    }
+
+
+    fn processTaskChunk(_: *SignalEngine, task: ProcessingTask, out_signals: *std.ArrayList(TradingSignal)) !void {
     fn processTaskChunk(_: *SignalEngine, task: ProcessingTask, out_signals: *std.ArrayList(TradingSignal)) !void {
         const chunk_len = task.end_idx - task.start_idx;
+        const chunk_len = task.end_idx - task.start_idx;
         if (chunk_len == 0) return;
+        if (chunk_len == 0) return;
+
 
         analyze_trading_signals_with_liquidity_simd(
             task.rsi_values[task.start_idx..].ptr,
