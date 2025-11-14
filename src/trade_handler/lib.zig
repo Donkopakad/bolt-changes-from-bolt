@@ -11,7 +11,7 @@ pub const TradeHandler = struct {
     allocator: std.mem.Allocator,
     signal_queue: std.ArrayList(TradingSignal),
     signal_thread: ?std.Thread,
-    should_stop: std.atomic.Value(bool),
+    run_flag: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
     portfolio_manager: PortfolioManager,
 
@@ -25,7 +25,7 @@ pub const TradeHandler = struct {
             .allocator = allocator,
             .signal_queue = std.ArrayList(TradingSignal).init(allocator),
             .signal_thread = null,
-            .should_stop = std.atomic.Value(bool).init(false),
+            .run_flag = std.atomic.Value(bool).init(true),
             .mutex = std.Thread.Mutex{},
             .portfolio_manager = PortfolioManager.init(allocator, symbol_map),
 
@@ -35,7 +35,7 @@ pub const TradeHandler = struct {
     }
 
     pub fn deinit(self: *TradeHandler) void {
-        self.should_stop.store(true, .seq_cst);
+        self.run_flag.store(false, .seq_cst);
         if (self.signal_thread) |thread| {
             thread.join();
         }
@@ -108,10 +108,10 @@ pub const TradeHandler = struct {
 
     fn signalThreadFunction(self: *TradeHandler) !void {
         std.log.info("Trade handler thread started", .{});
-        while (!self.should_stop.load(.seq_cst)) {
+        while (self.run_flag.load(.seq_cst)) {
             self.mutex.lock();
             const queues = &[_]*std.ArrayList(TradingSignal){
-                &self.high_strength_sell,                          
+                &self.high_strength_sell,
                 &self.high_strength_buy,
                 &self.low_strength_sell,
                 &self.low_strength_buy,
@@ -137,26 +137,3 @@ pub const TradeHandler = struct {
                 std.time.sleep(100_000);
             }
         }
-        std.log.info("Trade handler thread stopped", .{});
-    }
-
-    inline fn executeSignalFast(self: *TradeHandler, signal: TradingSignal) !void {
-        try self.portfolio_manager.processSignal(signal);
-    }
-
-    pub fn getStats(self: *TradeHandler) struct {
-        open_positions: usize,
-        pending_buy_signals: usize,
-        pending_sell_signals: usize,
-        recent_signals: usize,
-    } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return .{
-            .open_positions = self.getOpenPositionsCount(),
-            .pending_buy_signals = self.signal_queue.items.len,
-            .pending_sell_signals = self.sell_queue.items.len,
-            .recent_signals = self.recent_signals.items.len,
-        };
-    }
-};
