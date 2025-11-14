@@ -5,6 +5,8 @@ const SymbolMap = symbol_map.SymbolMap;
 const std = @import("std");
 const types = @import("types.zig");
 const Symbol = types.Symbol;
+const csv_generator = @import("csv_generator.zig");
+const AtomicBool = std.atomic.Value(bool);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -25,6 +27,13 @@ pub fn main() !void {
     const smp_allocator = std.heap.smp_allocator;
     var aggregator = try DataAggregator.init(enable_metrics, smp_allocator);
     defer aggregator.deinit();
+
+    var csv_stop_flag = AtomicBool.init(true);
+    const csv_thread = try std.Thread.spawn(.{}, csv_generator.run, .{&csv_stop_flag});
+    defer {
+        csv_stop_flag.store(false, .SeqCst);
+        csv_thread.join();
+    }
 
     var signal_engine = try SignalEngine.init(smp_allocator, aggregator.symbol_map);
     defer signal_engine.deinit();
@@ -47,3 +56,4 @@ pub fn main() !void {
     std.log.info("Reached 180-minute limit, stopping...", .{});
     // TODO: SELL ALL TRADES
 }
+
