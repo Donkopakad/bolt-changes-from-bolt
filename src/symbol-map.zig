@@ -27,7 +27,10 @@ pub fn dump(self: *const SymbolMap) void {
 pub fn getLastClosePrice(self: *const SymbolMap, symbol: []const u8) GetPriceError!f64 {
     if (self.get(symbol)) |sym| {
         if (sym.count > 0) {
-            const latest_idx = (sym.head + 15 - 1) % 15;
+            const latest_idx = if (sym.count == 15)
+                (sym.head + 15 - 1) % 15
+            else
+                (sym.head + sym.count - 1) % 15;
             return sym.ticker_queue[latest_idx].close_price;
         } else {
             return GetPriceError.NoPriceDataAvailable;
