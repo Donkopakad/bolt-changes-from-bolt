@@ -5,7 +5,6 @@ const portfolio_manager = @import("portfolio_manager.zig");
 const PortfolioManager = portfolio_manager.PortfolioManager;
 const PositionSide = portfolio_manager.PositionSide;
 const TradingSignal = types.TradingSignal;
-const SignalType = types.SignalType;
 
 pub const TradeHandler = struct {
     allocator: std.mem.Allocator,
@@ -13,12 +12,8 @@ pub const TradeHandler = struct {
     signal_thread: ?std.Thread,
     run_flag: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
+    condition: std.Thread.Condition,
     portfolio_manager: PortfolioManager,
-
-    high_strength_sell: std.ArrayList(TradingSignal),
-    high_strength_buy: std.ArrayList(TradingSignal),
-    low_strength_sell: std.ArrayList(TradingSignal),
-    low_strength_buy: std.ArrayList(TradingSignal),
 
     pub fn init(allocator: std.mem.Allocator, symbol_map: *const SymbolMap) TradeHandler {
         return TradeHandler{
@@ -26,24 +21,19 @@ pub const TradeHandler = struct {
             .signal_queue = std.ArrayList(TradingSignal).init(allocator),
             .signal_thread = null,
             .run_flag = std.atomic.Value(bool).init(true),
-            .mutex = std.Thread.Mutex{},
+            .mutex = .{},
+            .condition = .{},
             .portfolio_manager = PortfolioManager.init(allocator, symbol_map),
-
-            .high_strength_sell = std.ArrayList(TradingSignal).init(allocator),
-@@ -35,79 +36,81 @@ pub const TradeHandler = struct {
         };
     }
 
     pub fn deinit(self: *TradeHandler) void {
         self.run_flag.store(false, .seq_cst);
+        self.condition.signal();
         if (self.signal_thread) |thread| {
             thread.join();
         }
         self.signal_queue.deinit();
-        self.high_strength_sell.deinit();
-        self.high_strength_buy.deinit();
-        self.low_strength_sell.deinit();
-        self.low_strength_buy.deinit();
         self.portfolio_manager.deinit();
     }
 
@@ -53,87 +43,41 @@ pub const TradeHandler = struct {
 
     pub fn addSignal(self: *TradeHandler, signal: TradingSignal) !void {
         self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const is_high = signal.signal_strength > 0.9;
-        const side = self.portfolio_manager.getPositionSide(signal.symbol_name);
-
-        switch (signal.signal_type) {
-            .SELL => {
-                if (side != .short) {
-                    if (is_high) {
-                        try self.high_strength_sell.append(signal);
-                    } else {
-                        try self.low_strength_sell.append(signal);
-                    }
-                }
-            },
-            .BUY => {
-                if (side != .long) {
-                    if (is_high) {
-                        try self.high_strength_buy.append(signal);
-                    } else {
-                        try self.low_strength_buy.append(signal);
-                    }
-                }
-            },
-            .HOLD => return,
+        const append_result = self.signal_queue.append(signal);
+        self.condition.signal();
+        self.mutex.unlock();
+        if (append_result) |_| {
+            // ok
+        } else |err| {
+            return err;
         }
-    }
-
-    pub inline fn hasOpenPosition(self: *TradeHandler, symbol_name: []const u8) bool {
-        return self.portfolio_manager.getPositionSide(symbol_name) != .none;
     }
 
     pub inline fn getPositionSide(self: *TradeHandler, symbol_name: []const u8) PositionSide {
         return self.portfolio_manager.getPositionSide(symbol_name);
     }
 
-    pub fn getOpenPositionsCount(self: *TradeHandler) usize {
-        var count: usize = 0;
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var iterator = self.portfolio_manager.positions.iterator();
-        while (iterator.next()) |entry| {
-            if (entry.value_ptr.is_open) {
-                count += 1;
-            }
-        }
-        return count;
-    }
-
-    pub fn getPendingSignalsCount(self: *TradeHandler) usize {
-        return self.signal_queue.items.len + self.sell_queue.items.len;
-    }
-
     fn signalThreadFunction(self: *TradeHandler) !void {
         std.log.info("Trade handler thread started", .{});
         while (self.run_flag.load(.seq_cst)) {
             self.mutex.lock();
-            const queues = &[_]*std.ArrayList(TradingSignal){
-                &self.high_strength_sell,
-                &self.high_strength_buy,
-                &self.low_strength_sell,
-                &self.low_strength_buy,
-            };
-
-            var signals_processed = false;
-            for (queues) |queue| {
-                while (queue.items.len > 0) {
-                    const signal = queue.orderedRemove(0);
-                    self.mutex.unlock();
-                    try self.executeSignalFast(signal);
-                    signals_processed = true;
-                    self.mutex.lock();
-                }
+            while (self.signal_queue.items.len == 0 and self.run_flag.load(.seq_cst)) {
+                self.condition.wait(&self.mutex);
             }
+            if (!self.run_flag.load(.seq_cst)) {
+                self.mutex.unlock();
+                break;
+            }
+            const signal = self.signal_queue.orderedRemove(0);
             self.mutex.unlock();
 
-            self.portfolio_manager.checkStopLossConditions() catch |err| {
-                std.log.warn("Failed to check stop loss conditions: {}", .{err});
+            self.portfolio_manager.processSignal(signal) catch |err| {
+                std.log.err("Failed to process signal: {}", .{err});
             };
 
-            if (!signals_processed) {
-                std.time.sleep(100_000);
-            }
+            self.portfolio_manager.checkStopLossConditions() catch |err| {
+                std.log.warn("Failed to apply time-based exit checks: {}", .{err});
+            };
         }
+    }
+};
