@@ -5,8 +5,6 @@ const SymbolMap = symbol_map.SymbolMap;
 const std = @import("std");
 const types = @import("types.zig");
 const Symbol = types.Symbol;
-const csv_generator = @import("csv_generator.zig");
-const AtomicBool = std.atomic.Value(bool);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -28,13 +26,6 @@ pub fn main() !void {
     var aggregator = try DataAggregator.init(enable_metrics, smp_allocator);
     defer aggregator.deinit();
 
-    var run_flag = AtomicBool.init(true);
-    const csv_thread = try std.Thread.spawn(.{}, csv_generator.run, .{&run_flag});
-    defer {
-        run_flag.store(false, .SeqCst);
-        csv_thread.join();
-    }
-
     var signal_engine = try SignalEngine.init(smp_allocator, aggregator.symbol_map);
     defer signal_engine.deinit();
 
@@ -46,7 +37,7 @@ pub fn main() !void {
     try signal_engine.run();
 
     std.log.info("Trading system is running continuously. Press Ctrl+C to terminate.", .{});
-    while (run_flag.load(.SeqCst)) {
+    while (true) {
         std.time.sleep(std.time.ns_per_s);
     }
 }
