@@ -4,6 +4,7 @@ const symbol_map = @import("../symbol-map.zig");
 const SymbolMap = symbol_map.SymbolMap;
 const TradingSignal = types.TradingSignal;
 const SignalType = types.SignalType;
+const margin = @import("margin_enforcer.zig");
 
 pub const PositionSide = enum {
     none,
@@ -89,6 +90,7 @@ pub const PortfolioManager = struct {
 
     // binance testnet connection (mock for now)
     testnet_enabled: bool,
+    margin_enforcer: margin.MarginEnforcer,
 
     mutex: std.Thread.Mutex,
 
@@ -145,6 +147,7 @@ pub const PortfolioManager = struct {
             .normal_signal_lowest_loss_pct = 0.0,
 
             .testnet_enabled = true,
+            .margin_enforcer = margin.MarginEnforcer.init(allocator, true),
             .mutex = std.Thread.Mutex{},
             .last_balance_log = std.time.nanoTimestamp(),
             .balance_log_interval = 30_000_000_000, // 30 seconds for HFT
@@ -155,6 +158,7 @@ pub const PortfolioManager = struct {
     pub fn deinit(self: *PortfolioManager) void {
         self.positions.deinit();
         self.trade_history.deinit();
+        self.margin_enforcer.deinit();
     }
 
     pub fn calculatePositionSize(self: *const PortfolioManager, signal_strength: f32, available_liquidity: f64, symbol_price: f64) f32 {
@@ -274,6 +278,11 @@ pub const PortfolioManager = struct {
     }
 
     fn executeBuy(self: *PortfolioManager, signal: TradingSignal, price: f64, timestamp: i128) void {
+        self.margin_enforcer.ensureIsolatedMargin(signal.symbol_name) catch |err| {
+            std.log.err("Failed to enforce isolated margin for {s}: {}", .{ signal.symbol_name, err });
+            return;
+        };
+
         if (self.positions.getPtr(signal.symbol_name)) |position| {
             if (!position.is_open) return;
             if (position.side == .short) {
@@ -286,6 +295,11 @@ pub const PortfolioManager = struct {
     }
 
     fn executeSell(self: *PortfolioManager, signal: TradingSignal, price: f64, timestamp: i128) void {
+        self.margin_enforcer.ensureIsolatedMargin(signal.symbol_name) catch |err| {
+            std.log.err("Failed to enforce isolated margin for {s}: {}", .{ signal.symbol_name, err });
+            return;
+        };
+
         if (self.positions.getPtr(signal.symbol_name)) |position| {
             if (!position.is_open) {
                 std.log.warn("Position for {s} is already closed", .{signal.symbol_name});
@@ -368,7 +382,8 @@ pub const PortfolioManager = struct {
         } else {
             self.normal_signal_trades += 1;
         }
-        std.log.info("EXECUTED BUY: {s} | Amount: {d:.6} | Price: ${d:.4} | Size: ${d:.2} | Leverage: {d:.1}x | Strength: {d:.2} | Fee: ${d:.4} | RSI: {d:.2}", .{
+
+        std.log.info("EXECUTED LONG BUY: {s} | Amount: {d:.6} | Price: ${d:.4} | Size: ${d:.2} | Leverage: {d:.1}x | Strength: {d:.2} | Fee: ${d:.4} | RSI: {d:.2}", .{
             signal.symbol_name, amount, price, position_size_usdt, leverage, signal.signal_strength, fee, signal.rsi_value,
         });
     }
@@ -383,7 +398,7 @@ pub const PortfolioManager = struct {
         const position_size_usdt = @as(f64, @floatCast(base_size)) * @as(f64, @floatCast(leverage));
 
         if (self.current_balance < position_size_usdt) {
-            std.log.warn("Insufficient balance for SHORT {s} (need ${d:.2}, have ${d:.2})", .{ signal.symbol_name, position_size_usdt, self.current_balance });
+            std.log.warn("Insufficient balance for SELL {s} (need ${d:.2}, have ${d:.2})", .{ signal.symbol_name, position_size_usdt, self.current_balance });
             return;
         }
 
@@ -638,18 +653,16 @@ pub const PortfolioManager = struct {
 
     pub fn getPositionSide(self: *const PortfolioManager, symbol_name: []const u8) PositionSide {
         if (self.positions.get(symbol_name)) |position| {
-            if (!position.is_open) return .none;
-            return position.side;
+            if (position.is_open) {
+                return position.side;
+            }
         }
         return .none;
     }
 
     pub fn logPerformance(self: *PortfolioManager) void {
-        const total_pnl = self.total_realized_pnl + self.total_unrealized_pnl;
-        const current_portfolio_value = self.current_balance + self.total_unrealized_pnl;
-        const total_return_pct = (total_pnl / self.initial_balance) * 100.0;
-
         const closed_trades = (self.total_trades - self.getOpenPositionsCount()) / 2;
+
         const overall_win_rate = if (closed_trades > 0)
             (@as(f64, @floatFromInt(self.winning_trades)) / @as(f64, @floatFromInt(closed_trades))) * 100.0
         else
@@ -659,7 +672,6 @@ pub const PortfolioManager = struct {
         else
             0.0;
 
-        // Calculate average profit and loss percentages
         const avg_profit_pct = if (self.winning_trades > 0)
             self.total_profit_pct / @as(f64, @floatFromInt(self.winning_trades))
         else
@@ -669,7 +681,8 @@ pub const PortfolioManager = struct {
         else
             0.0;
 
-        // Signal strength performance
+        const portfolio_value = self.current_balance + self.total_unrealized_pnl;
+
         const strong_win_rate = if (self.strong_signal_trades > 0)
             (@as(f64, @floatFromInt(self.strong_signal_wins)) / @as(f64, @floatFromInt(self.strong_signal_trades))) * 100.0
         else
@@ -688,7 +701,6 @@ pub const PortfolioManager = struct {
         else
             0.0;
 
-        // Average profit/loss for signal strength categories
         const strong_signal_avg_profit_pct = if (self.strong_signal_wins > 0)
             self.strong_signal_total_profit_pct / @as(f64, @floatFromInt(self.strong_signal_wins))
         else
@@ -707,16 +719,19 @@ pub const PortfolioManager = struct {
         else
             0.0;
 
-        const portfolio_value = self.current_balance + self.total_unrealized_pnl;
+        const strong_signal_highest_profit_pct = self.strong_signal_highest_profit_pct;
+        const strong_signal_lowest_loss_pct = self.strong_signal_lowest_loss_pct;
+        const normal_signal_highest_profit_pct = self.normal_signal_highest_profit_pct;
+        const normal_signal_lowest_loss_pct = self.normal_signal_lowest_loss_pct;
 
         const open_positions = self.getOpenPositionsCount();
 
-        std.log.info("=== PORTFOLIO PERFORMANCE ===", .{});
-        std.log.info("Balance: ${d:.2} | Initial: ${d:.2} | Total Net P&L: ${d:.2} ({d:.1}%)", .{
-            current_portfolio_value, self.initial_balance, total_pnl, total_return_pct,
-        });
-        std.log.info("Realized P&L: ${d:.2} | Unrealized P&L: ${d:.2}", .{
-            self.total_realized_pnl, self.total_unrealized_pnl,
+        std.log.info("=============================", .{});
+        std.log.info("Balance: ${d:.2} | Portfolio Value: ${d:.2} | Realized P&L: ${d:.2} | Unrealized P&L: ${d:.2}", .{
+            self.current_balance,
+            portfolio_value,
+            self.total_realized_pnl,
+            self.total_unrealized_pnl,
         });
         std.log.info("Closed Trades: {} | Win Rate: {d:.1}% | Loss Rate: {d:.1}%", .{
             closed_trades, overall_win_rate, overall_loss_rate,
@@ -725,7 +740,7 @@ pub const PortfolioManager = struct {
             avg_profit_pct, avg_loss_pct, self.highest_profit_pct, self.lowest_loss_pct,
         });
         std.log.info("Strong Signals: {} trades | Win: {d:.1}% | Loss: {d:.1}% | Avg P: {d:.2}% | Avg L: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
-            self.strong_signal_trades, strong_win_rate, strong_loss_rate, strong_signal_avg_profit_pct, strong_signal_avg_loss_pct, self.strong_signal_highest_profit_pct, self.strong_signal_lowest_loss_pct,
+            self.strong_signal_trades, strong_win_rate, strong_loss_rate, strong_signal_avg_profit_pct, strong_signal_avg_loss_pct, strong_signal_highest_profit_pct, strong_signal_lowest_loss_pct,
         });
         std.log.info("Normal Signals: {} trades | Win: {d:.1}% | Loss: {d:.1}% | Avg P: {d:.2}% | Avg L: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
             self.normal_signal_trades, normal_win_rate, normal_loss_rate, normal_signal_avg_profit_pct, normal_signal_avg_loss_pct, self.normal_signal_highest_profit_pct, self.normal_signal_lowest_loss_pct,
