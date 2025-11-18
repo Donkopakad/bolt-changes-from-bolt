@@ -12,30 +12,13 @@ pub const PositionSide = enum {
     short,
 };
 
-const Trade = struct {
-    symbol: []const u8,
-    side: SignalType,
-    amount: f64,
-    price: f64,
-    fee: f64,
-    timestamp: i128,
-    rsi_value: f32,
-    orderbook_percentage: f32,
-    signal_strength: f32,
-    position_size_usdt: f64,
-    leverage: f32,
-};
-
 const PortfolioPosition = struct {
     symbol: []const u8,
     amount: f64,
     avg_entry_price: f64,
-    unrealized_pnl: f64,
-    realized_pnl: f64,
     entry_timestamp: i128,
-    candle_end_timestamp: i128, // nanosecond timestamp for the 15m candle end that generated the signal
-    entry_rsi: f32,
-    entry_signal_strength: f32,
+    candle_start_timestamp: i128,
+    candle_end_timestamp: i128,
     position_size_usdt: f64,
     is_open: bool,
     side: PositionSide,
@@ -46,826 +29,180 @@ pub const PortfolioManager = struct {
     allocator: std.mem.Allocator,
     symbol_map: *const SymbolMap,
 
-    initial_balance: f64,
-    current_balance: f64,
-    max_positions: usize,
-
-    base_position_size_usdt: f64,
-    max_position_size_usdt: f64,
-    min_position_size_usdt: f64,
-    max_portfolio_risk_pct: f64,
-
+    balance_usdt: f64,
     fee_rate: f64,
 
     positions: std.StringHashMap(PortfolioPosition),
-    trade_history: std.ArrayList(Trade),
-
-    // P&L tracking
-    total_realized_pnl: f64,
-    total_unrealized_pnl: f64,
-    total_trades: usize,
-    winning_trades: usize,
-    losing_trades: usize,
-    total_profit_pct: f64,
-    total_loss_pct: f64,
-    highest_profit_pct: f64,
-    lowest_loss_pct: f64,
-
-    // Signal strength statistics
-    strong_signal_trades: usize,
-    strong_signal_wins: usize,
-    strong_signal_losses: usize,
-    strong_signal_total_profit_pct: f64,
-    strong_signal_total_loss_pct: f64,
-    strong_signal_highest_profit_pct: f64,
-    strong_signal_lowest_loss_pct: f64,
-
-    normal_signal_trades: usize,
-    normal_signal_wins: usize,
-    normal_signal_losses: usize,
-    normal_signal_total_profit_pct: f64,
-    normal_signal_total_loss_pct: f64,
-    normal_signal_highest_profit_pct: f64,
-    normal_signal_lowest_loss_pct: f64,
-
-    // binance testnet connection (mock for now)
-    testnet_enabled: bool,
     margin_enforcer: margin.MarginEnforcer,
 
-    mutex: std.Thread.Mutex,
-
-    last_balance_log: i128,
-    balance_log_interval: i128,
     candle_duration_ns: i128,
 
     pub fn init(allocator: std.mem.Allocator, sym_map: *const SymbolMap) PortfolioManager {
-        const initial_balance = 1000.0;
-        const base_size = initial_balance / 20.0; // 5% base position
-
         return PortfolioManager{
             .allocator = allocator,
             .symbol_map = sym_map,
-            .initial_balance = initial_balance,
-            .current_balance = initial_balance,
-            .max_positions = 15,
-
-            // Dynamic sizing parameters
-            .base_position_size_usdt = base_size,
-            .max_position_size_usdt = initial_balance / 10.0, // Max 10% per trade
-            .min_position_size_usdt = initial_balance / 50.0, // Min 2% per trade
-            .max_portfolio_risk_pct = 0.15, // Max 15% of portfolio at risk
-
-            .fee_rate = 0.001, // 0.1%
+            .balance_usdt = 1000.0,
+            .fee_rate = 0.001,
             .positions = std.StringHashMap(PortfolioPosition).init(allocator),
-            .trade_history = std.ArrayList(Trade).init(allocator),
-            .total_realized_pnl = 0.0,
-            .total_unrealized_pnl = 0.0,
-            .total_trades = 0,
-            .winning_trades = 0,
-            .losing_trades = 0,
-            .total_profit_pct = 0.0,
-            .total_loss_pct = 0.0,
-            .highest_profit_pct = 0.0,
-            .lowest_loss_pct = 0.0,
-
-            // Strong signal statistics
-            .strong_signal_trades = 0,
-            .strong_signal_wins = 0,
-            .strong_signal_losses = 0,
-            .strong_signal_total_profit_pct = 0.0,
-            .strong_signal_total_loss_pct = 0.0,
-            .strong_signal_highest_profit_pct = 0.0,
-            .strong_signal_lowest_loss_pct = 0.0,
-
-            // Normal signal statistics
-            .normal_signal_trades = 0,
-            .normal_signal_wins = 0,
-            .normal_signal_losses = 0,
-            .normal_signal_total_profit_pct = 0.0,
-            .normal_signal_total_loss_pct = 0.0,
-            .normal_signal_highest_profit_pct = 0.0,
-            .normal_signal_lowest_loss_pct = 0.0,
-
-            .testnet_enabled = true,
             .margin_enforcer = margin.MarginEnforcer.init(allocator, true),
-            .mutex = std.Thread.Mutex{},
-            .last_balance_log = std.time.nanoTimestamp(),
-            .balance_log_interval = 30_000_000_000, // 30 seconds for HFT
-            .candle_duration_ns = 15 * 60 * 1_000_000_000, // 15 minute candle duration
+            .candle_duration_ns = 15 * 60 * 1_000_000_000,
         };
     }
 
     pub fn deinit(self: *PortfolioManager) void {
         self.positions.deinit();
-        self.trade_history.deinit();
         self.margin_enforcer.deinit();
     }
 
-    pub fn calculatePositionSize(self: *const PortfolioManager, signal_strength: f32, available_liquidity: f64, symbol_price: f64) f32 {
-        const base_size = self.base_position_size_usdt * signal_strength;
-
-        // Adjust based on liquidity
-        const max_liquidity_consumption = 0.25; // Max 25% of available liquidity
-        const available_size = available_liquidity * symbol_price * max_liquidity_consumption;
-
-        // Take minimum of intended size and liquidity-constrained size
-        const liquidity_adjusted = @min(base_size, available_size);
-
-        return @as(f32, @floatCast(@max(self.min_position_size_usdt, @min(liquidity_adjusted, self.max_position_size_usdt))));
+    pub fn processSignal(self: *PortfolioManager, signal: TradingSignal) !void {
+        const price = try symbol_map.getLastClosePrice(self.symbol_map, signal.symbol_name);
+        switch (signal.signal_type) {
+            .BUY => self.executeBuy(signal, price),
+            .SELL => self.executeSell(signal, price),
+            .HOLD => {},
+        }
     }
 
     pub fn checkStopLossConditions(self: *PortfolioManager) !void {
-        var positions_to_close = std.ArrayList(struct {
-            symbol: []const u8,
-            side: PositionSide,
-            reason: []const u8,
-        }).init(self.allocator);
-        defer positions_to_close.deinit();
+        const now_ns = std.time.nanoTimestamp();
+        var to_close = std.ArrayList([]const u8).init(self.allocator);
+        defer to_close.deinit();
 
-        const current_time = std.time.nanoTimestamp();
-        var iterator = self.positions.iterator();
-
-        while (iterator.next()) |entry| {
+        var it = self.positions.iterator();
+        while (it.next()) |entry| {
             const position = entry.value_ptr;
             if (!position.is_open) continue;
-
-            const current_price = symbol_map.getLastClosePrice(self.symbol_map, position.symbol) catch |err| {
-                std.log.warn("Failed to get current price for {s}: {}", .{ position.symbol, err });
-                continue;
-            };
-
-            var should_close = false;
-            var close_reason: []const u8 = "";
-
-            const profit_percentage = if (position.side == .long)
-                ((current_price - position.avg_entry_price) / position.avg_entry_price) * 100.0
-            else
-                ((position.avg_entry_price - current_price) / position.avg_entry_price) * 100.0;
-
-            // Previously this used "entry_timestamp + max_hold_duration_ns" (15m from entry).
-            // Now we align to the 15m candle end that generated the signal.
-            if (current_time >= position.candle_end_timestamp) {
-                should_close = true;
-                close_reason = "TIME LIMIT (candle end)";
-            }
-
-            if (should_close) {
-                const reason = if (close_reason.len > 0) close_reason else "TIME LIMIT (candle end)";
-                positions_to_close.append(.{ .symbol = position.symbol, .side = position.side, .reason = reason }) catch |err| {
-                    std.log.err("Failed to add position to close list: {}", .{err});
-                    continue;
-                };
+            if (now_ns >= position.candle_end_timestamp) {
+                try to_close.append(entry.key_ptr.*);
             }
         }
 
-        for (positions_to_close.items) |close_req| {
-            if (self.positions.getPtr(close_req.symbol)) |position| {
-                const current_price = symbol_map.getLastClosePrice(self.symbol_map, close_req.symbol) catch continue;
-                const current_time_final = std.time.nanoTimestamp();
-                const profit_percentage = if (position.side == .long)
-                    ((current_price - position.avg_entry_price) / position.avg_entry_price) * 100.0
-                else
-                    ((position.avg_entry_price - current_price) / position.avg_entry_price) * 100.0;
-
-                var actual_reason: []const u8 = close_req.reason;
-                if (actual_reason.len == 0) {
-                    actual_reason = "TIME LIMIT (candle end)";
-                }
-
-                std.log.warn("{s} TRIGGERED for {s}: Entry: ${d:.4}, Current: ${d:.4}, P&L: {d:.1}%", .{
-                    actual_reason,
-                    close_req.symbol,
-                    position.avg_entry_price,
-                    current_price,
-                    profit_percentage,
-                });
-
-                const close_signal = TradingSignal{
-                    .symbol_name = close_req.symbol,
-                    .signal_type = if (close_req.side == .short) .BUY else .SELL,
-                    .rsi_value = 50.0, // neutral RSI
-                    .orderbook_percentage = 0.0,
-                    .timestamp = current_time_final,
-                    .signal_strength = 1.0,
-                    .leverage = position.leverage,
-                };
-
-                if (close_req.side == .short) {
-                    self.executeBuy(close_signal, current_price, current_time_final);
-                } else {
-                    self.executeSell(close_signal, current_price, current_time_final);
+        for (to_close.items) |sym_name| {
+            if (self.positions.getPtr(sym_name)) |pos| {
+                const price = try symbol_map.getLastClosePrice(self.symbol_map, sym_name);
+                if (pos.side == .long) {
+                    self.closeLong(pos, price);
+                } else if (pos.side == .short) {
+                    self.closeShort(pos, price);
                 }
             }
         }
     }
 
-    pub fn processSignal(self: *PortfolioManager, signal: TradingSignal) !void {
-        const current_time = std.time.nanoTimestamp();
-        const last_close_price = try symbol_map.getLastClosePrice(self.symbol_map, signal.symbol_name);
-
-        switch (signal.signal_type) {
-            .BUY => self.executeBuy(signal, last_close_price, signal.timestamp),
-            .SELL => self.executeSell(signal, last_close_price, signal.timestamp),
-            .HOLD => {},
-        }
-
-        try self.updateUnrealizedPnL();
-
-        if (current_time - self.last_balance_log >= self.balance_log_interval) {
-            self.logPerformance();
-            self.last_balance_log = current_time;
-        }
-    }
-
-    fn executeBuy(self: *PortfolioManager, signal: TradingSignal, price: f64, timestamp: i128) void {
+    fn executeBuy(self: *PortfolioManager, signal: TradingSignal, price: f64) void {
         self.margin_enforcer.ensureIsolatedMargin(signal.symbol_name) catch |err| {
             std.log.err("Failed to enforce isolated margin for {s}: {}", .{ signal.symbol_name, err });
             return;
         };
 
-        if (self.positions.getPtr(signal.symbol_name)) |position| {
-            if (!position.is_open) return;
-            if (position.side == .short) {
-                self.closeShortPosition(position, signal, price, timestamp);
+        if (self.positions.getPtr(signal.symbol_name)) |pos| {
+            if (pos.is_open and pos.side == .short) {
+                self.closeShort(pos, price);
             }
             return;
         }
 
-        self.openLongPosition(signal, price, timestamp);
+        self.openPosition(signal, price, .long);
     }
 
-    fn executeSell(self: *PortfolioManager, signal: TradingSignal, price: f64, timestamp: i128) void {
+    fn executeSell(self: *PortfolioManager, signal: TradingSignal, price: f64) void {
         self.margin_enforcer.ensureIsolatedMargin(signal.symbol_name) catch |err| {
             std.log.err("Failed to enforce isolated margin for {s}: {}", .{ signal.symbol_name, err });
             return;
         };
 
-        if (self.positions.getPtr(signal.symbol_name)) |position| {
-            if (!position.is_open) {
-                std.log.warn("Position for {s} is already closed", .{signal.symbol_name});
-                return;
-            }
-
-            if (position.side == .long) {
-                self.closeLongPosition(position, signal, price, timestamp);
+        if (self.positions.getPtr(signal.symbol_name)) |pos| {
+            if (pos.is_open and pos.side == .long) {
+                self.closeLong(pos, price);
             }
             return;
         }
 
-        self.openShortPosition(signal, price, timestamp);
+        self.openPosition(signal, price, .short);
     }
 
-    fn openLongPosition(self: *PortfolioManager, signal: TradingSignal, price: f64, timestamp: i128) void {
-        if (self.getOpenPositionsCount() >= self.max_positions) {
-            return;
-        }
-
-        const base_size = self.calculatePositionSize(signal.signal_strength, self.current_balance, price);
+    fn openPosition(self: *PortfolioManager, signal: TradingSignal, price: f64, side: PositionSide) void {
         const leverage = if (signal.leverage > 0) signal.leverage else 1.0;
-        const position_size_usdt = @as(f64, @floatCast(base_size)) * @as(f64, @floatCast(leverage));
-
-        if (self.current_balance < position_size_usdt) {
-            std.log.warn("Insufficient balance for BUY {s} (need ${d:.2}, have ${d:.2})", .{ signal.symbol_name, position_size_usdt, self.current_balance });
+        const position_size_usdt = @as(f64, @floatCast(@max(10.0, self.balance_usdt * 0.05))) * @as(f64, @floatCast(leverage));
+        if (self.balance_usdt < position_size_usdt) {
+            std.log.warn("Insufficient balance to open {s} {s}", .{ side == .long ? "LONG" : "SHORT", signal.symbol_name });
             return;
         }
 
         const amount = position_size_usdt / (price * (1.0 + self.fee_rate));
-        const trade_volume = amount * price;
-        const fee = trade_volume * self.fee_rate;
-
-        const trade = Trade{
-            .symbol = signal.symbol_name,
-            .side = .BUY,
-            .amount = amount,
-            .price = price,
-            .fee = fee,
-            .timestamp = timestamp,
-            .rsi_value = signal.rsi_value,
-            .orderbook_percentage = signal.orderbook_percentage,
-            .signal_strength = signal.signal_strength,
-            .position_size_usdt = position_size_usdt,
-            .leverage = leverage,
-        };
-
-        const candle_end_timestamp = self.computeCandleEndTimestamp(signal.timestamp);
+        const candle_start_ns = self.currentCandleStart(signal.symbol_name, signal.timestamp);
+        const candle_end_ns = candle_start_ns + self.candle_duration_ns;
 
         const position = PortfolioPosition{
             .symbol = signal.symbol_name,
             .amount = amount,
             .avg_entry_price = price,
-            .unrealized_pnl = 0.0,
-            .realized_pnl = 0.0,
-            .entry_timestamp = timestamp,
-            .candle_end_timestamp = candle_end_timestamp,
-            .entry_rsi = signal.rsi_value,
-            .entry_signal_strength = signal.signal_strength,
+            .entry_timestamp = signal.timestamp,
+            .candle_start_timestamp = candle_start_ns,
+            .candle_end_timestamp = candle_end_ns,
             .position_size_usdt = position_size_usdt,
             .is_open = true,
-            .side = .long,
+            .side = side,
             .leverage = leverage,
         };
 
         self.positions.put(signal.symbol_name, position) catch |err| {
-            std.log.err("Failed to add position: {}", .{err});
+            std.log.err("Failed to record position: {}", .{err});
             return;
         };
 
-        self.trade_history.append(trade) catch |err| {
-            std.log.err("Failed to record trade: {}", .{err});
-        };
-
-        self.current_balance -= position_size_usdt;
-        self.total_trades += 1;
-
-        if (signal.signal_strength >= 0.9) {
-            self.strong_signal_trades += 1;
-        } else {
-            self.normal_signal_trades += 1;
-        }
-
-        std.log.info("EXECUTED LONG BUY: {s} | Amount: {d:.6} | Price: ${d:.4} | Size: ${d:.2} | Leverage: {d:.1}x | Strength: {d:.2} | Fee: ${d:.4} | RSI: {d:.2}", .{
-            signal.symbol_name, amount, price, position_size_usdt, leverage, signal.signal_strength, fee, signal.rsi_value,
+        self.balance_usdt -= position_size_usdt;
+        std.log.info("Opened {s} on {s} at ${d:.4} size ${d:.2} candle_end={d}", .{
+            side == .long ? "LONG" : "SHORT",
+            signal.symbol_name,
+            price,
+            position_size_usdt,
+            candle_end_ns,
         });
     }
 
-    fn openShortPosition(self: *PortfolioManager, signal: TradingSignal, price: f64, timestamp: i128) void {
-        if (self.getOpenPositionsCount() >= self.max_positions) {
-            return;
-        }
-
-        const base_size = self.calculatePositionSize(signal.signal_strength, self.current_balance, price);
-        const leverage = if (signal.leverage > 0) signal.leverage else 1.0;
-        const position_size_usdt = @as(f64, @floatCast(base_size)) * @as(f64, @floatCast(leverage));
-
-        if (self.current_balance < position_size_usdt) {
-            std.log.warn("Insufficient balance for SELL {s} (need ${d:.2}, have ${d:.2})", .{ signal.symbol_name, position_size_usdt, self.current_balance });
-            return;
-        }
-
-        const amount = position_size_usdt / (price * (1.0 + self.fee_rate));
-        const trade_volume = amount * price;
-        const fee = trade_volume * self.fee_rate;
-
-        const trade = Trade{
-            .symbol = signal.symbol_name,
-            .side = .SELL,
-            .amount = amount,
-            .price = price,
-            .fee = fee,
-            .timestamp = timestamp,
-            .rsi_value = signal.rsi_value,
-            .orderbook_percentage = signal.orderbook_percentage,
-            .signal_strength = signal.signal_strength,
-            .position_size_usdt = position_size_usdt,
-            .leverage = leverage,
-        };
-
-        const candle_end_timestamp = self.computeCandleEndTimestamp(signal.timestamp);
-
-        const position = PortfolioPosition{
-            .symbol = signal.symbol_name,
-            .amount = amount,
-            .avg_entry_price = price,
-            .unrealized_pnl = 0.0,
-            .realized_pnl = 0.0,
-            .entry_timestamp = timestamp,
-            .candle_end_timestamp = candle_end_timestamp,
-            .entry_rsi = signal.rsi_value,
-            .entry_signal_strength = signal.signal_strength,
-            .position_size_usdt = position_size_usdt,
-            .is_open = true,
-            .side = .short,
-            .leverage = leverage,
-        };
-
-        self.positions.put(signal.symbol_name, position) catch |err| {
-            std.log.err("Failed to add position: {}", .{err});
-            return;
-        };
-
-        self.trade_history.append(trade) catch |err| {
-            std.log.err("Failed to record trade: {}", .{err});
-        };
-
-        self.current_balance -= position_size_usdt;
-        self.total_trades += 1;
-
-        if (signal.signal_strength >= 0.9) {
-            self.strong_signal_trades += 1;
-        } else {
-            self.normal_signal_trades += 1;
-        }
-
-        std.log.info("EXECUTED SHORT SELL: {s} | Amount: {d:.6} | Price: ${d:.4} | Size: ${d:.2} | Leverage: {d:.1}x | Strength: {d:.2} | Fee: ${d:.4} | RSI: {d:.2}", .{
-            signal.symbol_name, amount, price, position_size_usdt, leverage, signal.signal_strength, fee, signal.rsi_value,
-        });
-    }
-
-    fn closeLongPosition(self: *PortfolioManager, position: *PortfolioPosition, signal: TradingSignal, price: f64, timestamp: i128) void {
+    fn closeLong(self: *PortfolioManager, position: *PortfolioPosition, price: f64) void {
         const trade_volume = position.amount * price;
         const fee = trade_volume * self.fee_rate;
-        const net_proceeds = trade_volume - fee;
-
-        const pnl = net_proceeds - position.position_size_usdt;
-        const pnl_percentage = if (position.position_size_usdt > 0.0)
-            (pnl / position.position_size_usdt) * 100.0
-        else
-            0.0;
-
-        const trade = Trade{
-            .symbol = position.symbol,
-            .side = .SELL,
-            .amount = position.amount,
-            .price = price,
-            .fee = fee,
-            .timestamp = timestamp,
-            .rsi_value = signal.rsi_value,
-            .orderbook_percentage = signal.orderbook_percentage,
-            .signal_strength = signal.signal_strength,
-            .position_size_usdt = position.position_size_usdt,
-            .leverage = position.leverage,
-        };
+        const net = trade_volume - fee;
+        const pnl = net - position.position_size_usdt;
 
         position.is_open = false;
-        position.realized_pnl = pnl;
-        position.unrealized_pnl = 0.0;
         position.side = .none;
+        self.balance_usdt += net;
 
-        self.trade_history.append(trade) catch |err| {
-            std.log.err("Failed to record trade: {}", .{err});
-        };
-
-        self.current_balance += net_proceeds;
-        self.total_realized_pnl += pnl;
-        self.total_trades += 1;
-
-        self.updateCloseStats(position.*, pnl, pnl_percentage);
-
-        const hold_duration_ms = @divFloor(timestamp - position.entry_timestamp, 1_000_000);
-
-        std.log.info("EXECUTED SELL: {s} | Amount: {d:.6} | Price: ${d:.4} | P&L: ${d:.2} ({d:.1}%) | Entry Strength: {d:.2} | Exit Strength: {d:.2} | Hold: {d}ms", .{
-            position.symbol, position.amount, price, pnl, pnl_percentage, position.entry_signal_strength, signal.signal_strength, hold_duration_ms,
-        });
+        std.log.info("Closed LONG {s} at ${d:.4} pnl ${d:.4}", .{ position.symbol, price, pnl });
     }
 
-    fn closeShortPosition(self: *PortfolioManager, position: *PortfolioPosition, signal: TradingSignal, price: f64, timestamp: i128) void {
-        const cover_volume = position.amount * price;
-        const fee = cover_volume * self.fee_rate;
-        const gross_profit = (position.avg_entry_price - price) * position.amount;
-        const pnl = gross_profit - fee;
-        const pnl_percentage = if (position.avg_entry_price > 0.0)
-            (gross_profit / (position.avg_entry_price * position.amount)) * 100.0
-        else
-            0.0;
-
-        const trade = Trade{
-            .symbol = position.symbol,
-            .side = .BUY,
-            .amount = position.amount,
-            .price = price,
-            .fee = fee,
-            .timestamp = timestamp,
-            .rsi_value = signal.rsi_value,
-            .orderbook_percentage = signal.orderbook_percentage,
-            .signal_strength = signal.signal_strength,
-            .position_size_usdt = position.position_size_usdt,
-            .leverage = position.leverage,
-        };
+    fn closeShort(self: *PortfolioManager, position: *PortfolioPosition, price: f64) void {
+        const cover_cost = position.amount * price;
+        const fee = cover_cost * self.fee_rate;
+        const total = cover_cost + fee;
+        const pnl = position.position_size_usdt - total;
 
         position.is_open = false;
-        position.realized_pnl = pnl;
-        position.unrealized_pnl = 0.0;
         position.side = .none;
+        self.balance_usdt += position.position_size_usdt + pnl;
 
-        self.trade_history.append(trade) catch |err| {
-            std.log.err("Failed to record trade: {}", .{err});
-        };
-
-        self.current_balance += position.position_size_usdt + pnl;
-        self.total_realized_pnl += pnl;
-        self.total_trades += 1;
-
-        self.updateCloseStats(position.*, pnl, pnl_percentage);
-
-        const hold_duration_ms = @divFloor(timestamp - position.entry_timestamp, 1_000_000);
-        std.log.info("COVERED SHORT: {s} | Amount: {d:.6} | Price: ${d:.4} | P&L: ${d:.2} ({d:.1}%) | Entry Strength: {d:.2} | Exit Strength: {d:.2} | Hold: {d}ms", .{
-            position.symbol, position.amount, price, pnl, pnl_percentage, position.entry_signal_strength, signal.signal_strength, hold_duration_ms,
-        });
-    }
-
-    fn updateCloseStats(self: *PortfolioManager, position: PortfolioPosition, pnl: f64, pnl_percentage: f64) void {
-        if (pnl > 0) {
-            self.winning_trades += 1;
-            self.total_profit_pct += pnl_percentage;
-            if (pnl_percentage > self.highest_profit_pct) {
-                self.highest_profit_pct = pnl_percentage;
-            }
-        } else {
-            self.losing_trades += 1;
-            self.total_loss_pct += pnl_percentage;
-            if (pnl_percentage < self.lowest_loss_pct) {
-                self.lowest_loss_pct = pnl_percentage;
-            }
-        }
-
-        const is_strong_signal = position.entry_signal_strength >= 0.9;
-        if (is_strong_signal) {
-            if (pnl > 0) {
-                self.strong_signal_wins += 1;
-                self.strong_signal_total_profit_pct += pnl_percentage;
-                if (pnl_percentage > self.strong_signal_highest_profit_pct) {
-                    self.strong_signal_highest_profit_pct = pnl_percentage;
-                }
-            } else {
-                self.strong_signal_losses += 1;
-                self.strong_signal_total_loss_pct += pnl_percentage;
-                if (pnl_percentage < self.strong_signal_lowest_loss_pct) {
-                    self.strong_signal_lowest_loss_pct = pnl_percentage;
-                }
-            }
-        } else {
-            if (pnl > 0) {
-                self.normal_signal_wins += 1;
-                self.normal_signal_total_profit_pct += pnl_percentage;
-                if (pnl_percentage > self.normal_signal_highest_profit_pct) {
-                    self.normal_signal_highest_profit_pct = pnl_percentage;
-                }
-            } else {
-                self.normal_signal_losses += 1;
-                self.normal_signal_total_loss_pct += pnl_percentage;
-                if (pnl_percentage < self.normal_signal_lowest_loss_pct) {
-                    self.normal_signal_lowest_loss_pct = pnl_percentage;
-                }
-            }
-        }
-    }
-
-    fn computeCandleEndTimestamp(self: *const PortfolioManager, timestamp_ns: i128) i128 {
-        // Align the signal timestamp to the 15m candle that generated it.
-        const candle_duration_ms = @divFloor(self.candle_duration_ns, 1_000_000);
-        const timestamp_ms = @divFloor(timestamp_ns, 1_000_000);
-        const candle_start_ms = (timestamp_ms / candle_duration_ms) * candle_duration_ms; // 15m candle start boundary
-        const candle_end_ms = candle_start_ms + candle_duration_ms; // 15m candle end boundary
-        return candle_end_ms * 1_000_000; // back to ns
-    }
-
-    fn updateUnrealizedPnL(self: *PortfolioManager) !void {
-        self.total_unrealized_pnl = 0.0;
-
-        var iterator = self.positions.iterator();
-        while (iterator.next()) |entry| {
-            const position = entry.value_ptr;
-            if (position.is_open) {
-                const current_price = try symbol_map.getLastClosePrice(self.symbol_map, position.symbol);
-
-                const unrealized_pnl = switch (position.side) {
-                    .long => blk: {
-                        const gross_current_value = current_price * position.amount;
-                        const estimated_sell_fee = gross_current_value * self.fee_rate;
-                        const net_current_value = gross_current_value - estimated_sell_fee;
-                        break :blk net_current_value - position.position_size_usdt;
-                    },
-                    .short => blk: {
-                        const gross_cover_cost = current_price * position.amount;
-                        const estimated_buy_fee = gross_cover_cost * self.fee_rate;
-                        const total_cover_cost = gross_cover_cost + estimated_buy_fee;
-                        break :blk position.position_size_usdt - total_cover_cost;
-                    },
-                    .none => 0.0,
-                };
-
-                position.unrealized_pnl = unrealized_pnl;
-                self.total_unrealized_pnl += unrealized_pnl;
-            }
-        }
-    }
-
-    fn getOpenPositionsCount(self: *PortfolioManager) usize {
-        var count: usize = 0;
-        var iterator = self.positions.iterator();
-        while (iterator.next()) |entry| {
-            if (entry.value_ptr.is_open) {
-                count += 1;
-            }
-        }
-        return count;
+        std.log.info("Closed SHORT {s} at ${d:.4} pnl ${d:.4}", .{ position.symbol, price, pnl });
     }
 
     pub fn getPositionSide(self: *const PortfolioManager, symbol_name: []const u8) PositionSide {
-        if (self.positions.get(symbol_name)) |position| {
-            if (position.is_open) {
-                return position.side;
-            }
+        if (self.positions.get(symbol_name)) |pos| {
+            if (pos.is_open) return pos.side;
         }
         return .none;
     }
 
-    pub fn logPerformance(self: *PortfolioManager) void {
-        const closed_trades = (self.total_trades - self.getOpenPositionsCount()) / 2;
-
-        const overall_win_rate = if (closed_trades > 0)
-            (@as(f64, @floatFromInt(self.winning_trades)) / @as(f64, @floatFromInt(closed_trades))) * 100.0
-        else
-            0.0;
-        const overall_loss_rate = if (closed_trades > 0)
-            (@as(f64, @floatFromInt(self.losing_trades)) / @as(f64, @floatFromInt(closed_trades))) * 100.0
-        else
-            0.0;
-
-        const avg_profit_pct = if (self.winning_trades > 0)
-            self.total_profit_pct / @as(f64, @floatFromInt(self.winning_trades))
-        else
-            0.0;
-        const avg_loss_pct = if (self.losing_trades > 0)
-            self.total_loss_pct / @as(f64, @floatFromInt(self.losing_trades))
-        else
-            0.0;
-
-        const portfolio_value = self.current_balance + self.total_unrealized_pnl;
-
-        const strong_win_rate = if (self.strong_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.strong_signal_wins)) / @as(f64, @floatFromInt(self.strong_signal_trades))) * 100.0
-        else
-            0.0;
-        const strong_loss_rate = if (self.strong_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.strong_signal_losses)) / @as(f64, @floatFromInt(self.strong_signal_trades))) * 100.0
-        else
-            0.0;
-
-        const normal_win_rate = if (self.normal_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.normal_signal_wins)) / @as(f64, @floatFromInt(self.normal_signal_trades))) * 100.0
-        else
-            0.0;
-        const normal_loss_rate = if (self.normal_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.normal_signal_losses)) / @as(f64, @floatFromInt(self.normal_signal_trades))) * 100.0
-        else
-            0.0;
-
-        const strong_signal_avg_profit_pct = if (self.strong_signal_wins > 0)
-            self.strong_signal_total_profit_pct / @as(f64, @floatFromInt(self.strong_signal_wins))
-        else
-            0.0;
-        const strong_signal_avg_loss_pct = if (self.strong_signal_losses > 0)
-            self.strong_signal_total_loss_pct / @as(f64, @floatFromInt(self.strong_signal_losses))
-        else
-            0.0;
-
-        const normal_signal_avg_profit_pct = if (self.normal_signal_wins > 0)
-            self.normal_signal_total_profit_pct / @as(f64, @floatFromInt(self.normal_signal_wins))
-        else
-            0.0;
-        const normal_signal_avg_loss_pct = if (self.normal_signal_losses > 0)
-            self.normal_signal_total_loss_pct / @as(f64, @floatFromInt(self.normal_signal_losses))
-        else
-            0.0;
-
-        const strong_signal_highest_profit_pct = self.strong_signal_highest_profit_pct;
-        const strong_signal_lowest_loss_pct = self.strong_signal_lowest_loss_pct;
-        const normal_signal_highest_profit_pct = self.normal_signal_highest_profit_pct;
-        const normal_signal_lowest_loss_pct = self.normal_signal_lowest_loss_pct;
-
-        const open_positions = self.getOpenPositionsCount();
-
-        std.log.info("=============================", .{});
-        std.log.info("Balance: ${d:.2} | Portfolio Value: ${d:.2} | Realized P&L: ${d:.2} | Unrealized P&L: ${d:.2}", .{
-            self.current_balance,
-            portfolio_value,
-            self.total_realized_pnl,
-            self.total_unrealized_pnl,
-        });
-        std.log.info("Closed Trades: {} | Win Rate: {d:.1}% | Loss Rate: {d:.1}%", .{
-            closed_trades, overall_win_rate, overall_loss_rate,
-        });
-        std.log.info("Avg Profit: {d:.2}% | Avg Loss: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
-            avg_profit_pct, avg_loss_pct, self.highest_profit_pct, self.lowest_loss_pct,
-        });
-        std.log.info("Strong Signals: {} trades | Win: {d:.1}% | Loss: {d:.1}% | Avg P: {d:.2}% | Avg L: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
-            self.strong_signal_trades, strong_win_rate, strong_loss_rate, strong_signal_avg_profit_pct, strong_signal_avg_loss_pct, strong_signal_highest_profit_pct, strong_signal_lowest_loss_pct,
-        });
-        std.log.info("Normal Signals: {} trades | Win: {d:.1}% | Loss: {d:.1}% | Avg P: {d:.2}% | Avg L: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
-            self.normal_signal_trades, normal_win_rate, normal_loss_rate, normal_signal_avg_profit_pct, normal_signal_avg_loss_pct, self.normal_signal_highest_profit_pct, self.normal_signal_lowest_loss_pct,
-        });
-        std.log.info("Open Positions: {} / {} | Available Balance: ${d:.2}", .{
-            open_positions, self.max_positions, self.current_balance,
-        });
-        std.log.info("Position Sizing: Base: ${d:.2} | Min: ${d:.2} | Max: ${d:.2}", .{
-            self.base_position_size_usdt, self.min_position_size_usdt, self.max_position_size_usdt,
-        });
-        std.log.info("=============================", .{});
-    }
-
-    pub fn getStats(self: *PortfolioManager) struct {
-        balance: f64,
-        total_pnl: f64,
-        realized_pnl: f64,
-        unrealized_pnl: f64,
-        total_trades: usize,
-        win_rate: f64,
-        loss_rate: f64,
-        avg_profit_pct: f64,
-        avg_loss_pct: f64,
-        highest_profit_pct: f64,
-        lowest_loss_pct: f64,
-        open_positions: usize,
-        strong_signal_win_rate: f64,
-        strong_signal_loss_rate: f64,
-        strong_signal_avg_profit_pct: f64,
-        strong_signal_avg_loss_pct: f64,
-        strong_signal_highest_profit_pct: f64,
-        strong_signal_lowest_loss_pct: f64,
-        normal_signal_win_rate: f64,
-        normal_signal_loss_rate: f64,
-        normal_signal_avg_profit_pct: f64,
-        normal_signal_avg_loss_pct: f64,
-        normal_signal_highest_profit_pct: f64,
-        normal_signal_lowest_loss_pct: f64,
-        portfolio_value: f64,
-    } {
-        const total_pnl = self.total_realized_pnl + self.total_unrealized_pnl;
-        const closed_trades = (self.total_trades - self.getOpenPositionsCount()) / 2;
-        const win_rate = if (closed_trades > 0)
-            (@as(f64, @floatFromInt(self.winning_trades)) / @as(f64, @floatFromInt(closed_trades))) * 100.0
-        else
-            0.0;
-        const loss_rate = if (closed_trades > 0)
-            (@as(f64, @floatFromInt(self.losing_trades)) / @as(f64, @floatFromInt(closed_trades))) * 100.0
-        else
-            0.0;
-
-        const avg_profit_pct = if (self.winning_trades > 0)
-            self.total_profit_pct / @as(f64, @floatFromInt(self.winning_trades))
-        else
-            0.0;
-        const avg_loss_pct = if (self.losing_trades > 0)
-            self.total_loss_pct / @as(f64, @floatFromInt(self.losing_trades))
-        else
-            0.0;
-
-        const strong_win_rate = if (self.strong_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.strong_signal_wins)) / @as(f64, @floatFromInt(self.strong_signal_trades))) * 100.0
-        else
-            0.0;
-        const strong_loss_rate = if (self.strong_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.strong_signal_losses)) / @as(f64, @floatFromInt(self.strong_signal_trades))) * 100.0
-        else
-            0.0;
-
-        const normal_win_rate = if (self.normal_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.normal_signal_wins)) / @as(f64, @floatFromInt(self.normal_signal_trades))) * 100.0
-        else
-            0.0;
-        const normal_loss_rate = if (self.normal_signal_trades > 0)
-            (@as(f64, @floatFromInt(self.normal_signal_losses)) / @as(f64, @floatFromInt(self.normal_signal_trades))) * 100.0
-        else
-            0.0;
-
-        // Average profit/loss for signal strength categories
-        const strong_signal_avg_profit_pct = if (self.strong_signal_wins > 0)
-            self.strong_signal_total_profit_pct / @as(f64, @floatFromInt(self.strong_signal_wins))
-        else
-            0.0;
-        const strong_signal_avg_loss_pct = if (self.strong_signal_losses > 0)
-            self.strong_signal_total_loss_pct / @as(f64, @floatFromInt(self.strong_signal_losses))
-        else
-            0.0;
-
-        const normal_signal_avg_profit_pct = if (self.normal_signal_wins > 0)
-            self.normal_signal_total_profit_pct / @as(f64, @floatFromInt(self.normal_signal_wins))
-        else
-            0.0;
-        const normal_signal_avg_loss_pct = if (self.normal_signal_losses > 0)
-            self.normal_signal_total_loss_pct / @as(f64, @floatFromInt(self.normal_signal_losses))
-        else
-            0.0;
-
-        const portfolio_value = self.current_balance + self.total_unrealized_pnl;
-
-        return .{
-            .balance = self.current_balance,
-            .total_pnl = total_pnl,
-            .realized_pnl = self.total_realized_pnl,
-            .unrealized_pnl = self.total_unrealized_pnl,
-            .total_trades = closed_trades,
-            .win_rate = win_rate,
-            .loss_rate = loss_rate,
-            .avg_profit_pct = avg_profit_pct,
-            .avg_loss_pct = avg_loss_pct,
-            .highest_profit_pct = self.highest_profit_pct,
-            .lowest_loss_pct = self.lowest_loss_pct,
-            .open_positions = self.getOpenPositionsCount(),
-            .strong_signal_win_rate = strong_win_rate,
-            .strong_signal_loss_rate = strong_loss_rate,
-            .strong_signal_avg_profit_pct = strong_signal_avg_profit_pct,
-            .strong_signal_avg_loss_pct = strong_signal_avg_loss_pct,
-            .strong_signal_highest_profit_pct = self.strong_signal_highest_profit_pct,
-            .strong_signal_lowest_loss_pct = self.strong_signal_lowest_loss_pct,
-            .normal_signal_win_rate = normal_win_rate,
-            .normal_signal_loss_rate = normal_loss_rate,
-            .normal_signal_avg_profit_pct = normal_signal_avg_profit_pct,
-            .normal_signal_avg_loss_pct = normal_signal_avg_loss_pct,
-            .normal_signal_highest_profit_pct = self.normal_signal_highest_profit_pct,
-            .normal_signal_lowest_loss_pct = self.normal_signal_lowest_loss_pct,
-            .portfolio_value = portfolio_value,
-        };
+    fn currentCandleStart(self: *PortfolioManager, symbol_name: []const u8, timestamp_ns: i128) i128 {
+        if (self.symbol_map.get(symbol_name)) |symbol| {
+            if (symbol.candle_start_time > 0) {
+                return @as(i128, symbol.candle_start_time) * 1_000_000;
+            }
+        }
+        const duration_ms = @divFloor(self.candle_duration_ns, 1_000_000);
+        const ts_ms = @divFloor(timestamp_ns, 1_000_000);
+        const start_ms = (ts_ms / duration_ms) * duration_ms;
+        return start_ms * 1_000_000;
     }
 };
