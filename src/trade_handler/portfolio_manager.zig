@@ -32,6 +32,7 @@ const PortfolioPosition = struct {
     unrealized_pnl: f64,
     realized_pnl: f64,
     entry_timestamp: i128,
+    candle_end_timestamp: i128, // nanosecond timestamp for the 15m candle end that generated the signal
     entry_rsi: f32,
     entry_signal_strength: f32,
     position_size_usdt: f64,
@@ -63,7 +64,12 @@ pub const PortfolioManager = struct {
     total_unrealized_pnl: f64,
     total_trades: usize,
     winning_trades: usize,
-@@ -65,52 +74,51 @@ pub const PortfolioManager = struct {
+    losing_trades: usize,
+    total_profit_pct: f64,
+    total_loss_pct: f64,
+    highest_profit_pct: f64,
+    lowest_loss_pct: f64,
+
     // Signal strength statistics
     strong_signal_trades: usize,
     strong_signal_wins: usize,
@@ -88,8 +94,7 @@ pub const PortfolioManager = struct {
 
     last_balance_log: i128,
     balance_log_interval: i128,
-
-    max_hold_duration_ns: i128,
+    candle_duration_ns: i128,
 
     pub fn init(allocator: std.mem.Allocator, sym_map: *const SymbolMap) PortfolioManager {
         const initial_balance = 1000.0;
@@ -115,7 +120,9 @@ pub const PortfolioManager = struct {
             .total_unrealized_pnl = 0.0,
             .total_trades = 0,
             .winning_trades = 0,
-@@ -122,374 +130,532 @@ pub const PortfolioManager = struct {
+            .losing_trades = 0,
+            .total_profit_pct = 0.0,
+            .total_loss_pct = 0.0,
             .highest_profit_pct = 0.0,
             .lowest_loss_pct = 0.0,
 
@@ -141,7 +148,7 @@ pub const PortfolioManager = struct {
             .mutex = std.Thread.Mutex{},
             .last_balance_log = std.time.nanoTimestamp(),
             .balance_log_interval = 30_000_000_000, // 30 seconds for HFT
-            .max_hold_duration_ns = 15 * 60 * 1_000_000_000, // 15 minute timeframe
+            .candle_duration_ns = 15 * 60 * 1_000_000_000, // 15 minute candle duration
         };
     }
 
@@ -191,14 +198,15 @@ pub const PortfolioManager = struct {
             else
                 ((position.avg_entry_price - current_price) / position.avg_entry_price) * 100.0;
 
-            const time_elapsed = current_time - position.entry_timestamp;
-            if (time_elapsed >= self.max_hold_duration_ns) { // crosses 15 minute timeframe
+            // Previously this used "entry_timestamp + max_hold_duration_ns" (15m from entry).
+            // Now we align to the 15m candle end that generated the signal.
+            if (current_time >= position.candle_end_timestamp) {
                 should_close = true;
-                close_reason = "TIME LIMIT";
+                close_reason = "TIME LIMIT (candle end)";
             }
 
             if (should_close) {
-                const reason = if (close_reason.len > 0) close_reason else "TIME LIMIT";
+                const reason = if (close_reason.len > 0) close_reason else "TIME LIMIT (candle end)";
                 positions_to_close.append(.{ .symbol = position.symbol, .side = position.side, .reason = reason }) catch |err| {
                     std.log.err("Failed to add position to close list: {}", .{err});
                     continue;
@@ -210,7 +218,6 @@ pub const PortfolioManager = struct {
             if (self.positions.getPtr(close_req.symbol)) |position| {
                 const current_price = symbol_map.getLastClosePrice(self.symbol_map, close_req.symbol) catch continue;
                 const current_time_final = std.time.nanoTimestamp();
-                const time_elapsed = current_time_final - position.entry_timestamp;
                 const profit_percentage = if (position.side == .long)
                     ((current_price - position.avg_entry_price) / position.avg_entry_price) * 100.0
                 else
@@ -218,16 +225,15 @@ pub const PortfolioManager = struct {
 
                 var actual_reason: []const u8 = close_req.reason;
                 if (actual_reason.len == 0) {
-                    actual_reason = "TIME LIMIT";
+                    actual_reason = "TIME LIMIT (candle end)";
                 }
 
-                std.log.warn("{s} TRIGGERED for {s}: Entry: ${d:.4}, Current: ${d:.4}, P&L: {d:.1}%, Time: {d:.1}s", .{
+                std.log.warn("{s} TRIGGERED for {s}: Entry: ${d:.4}, Current: ${d:.4}, P&L: {d:.1}%", .{
                     actual_reason,
                     close_req.symbol,
                     position.avg_entry_price,
                     current_price,
                     profit_percentage,
-                    @as(f64, @floatFromInt(time_elapsed)) / 1_000_000_000.0,
                 });
 
                 const close_signal = TradingSignal{
@@ -254,8 +260,8 @@ pub const PortfolioManager = struct {
         const last_close_price = try symbol_map.getLastClosePrice(self.symbol_map, signal.symbol_name);
 
         switch (signal.signal_type) {
-            .BUY => self.executeBuy(signal, last_close_price, current_time),
-            .SELL => self.executeSell(signal, last_close_price, current_time),
+            .BUY => self.executeBuy(signal, last_close_price, signal.timestamp),
+            .SELL => self.executeSell(signal, last_close_price, signal.timestamp),
             .HOLD => {},
         }
 
@@ -327,6 +333,8 @@ pub const PortfolioManager = struct {
             .leverage = leverage,
         };
 
+        const candle_end_timestamp = self.computeCandleEndTimestamp(signal.timestamp);
+
         const position = PortfolioPosition{
             .symbol = signal.symbol_name,
             .amount = amount,
@@ -334,6 +342,7 @@ pub const PortfolioManager = struct {
             .unrealized_pnl = 0.0,
             .realized_pnl = 0.0,
             .entry_timestamp = timestamp,
+            .candle_end_timestamp = candle_end_timestamp,
             .entry_rsi = signal.rsi_value,
             .entry_signal_strength = signal.signal_strength,
             .position_size_usdt = position_size_usdt,
@@ -396,6 +405,8 @@ pub const PortfolioManager = struct {
             .leverage = leverage,
         };
 
+        const candle_end_timestamp = self.computeCandleEndTimestamp(signal.timestamp);
+
         const position = PortfolioPosition{
             .symbol = signal.symbol_name,
             .amount = amount,
@@ -403,6 +414,7 @@ pub const PortfolioManager = struct {
             .unrealized_pnl = 0.0,
             .realized_pnl = 0.0,
             .entry_timestamp = timestamp,
+            .candle_end_timestamp = candle_end_timestamp,
             .entry_rsi = signal.rsi_value,
             .entry_signal_strength = signal.signal_strength,
             .position_size_usdt = position_size_usdt,
@@ -573,6 +585,15 @@ pub const PortfolioManager = struct {
         }
     }
 
+    fn computeCandleEndTimestamp(self: *const PortfolioManager, timestamp_ns: i128) i128 {
+        // Align the signal timestamp to the 15m candle that generated it.
+        const candle_duration_ms = @divFloor(self.candle_duration_ns, 1_000_000);
+        const timestamp_ms = @divFloor(timestamp_ns, 1_000_000);
+        const candle_start_ms = (timestamp_ms / candle_duration_ms) * candle_duration_ms; // 15m candle start boundary
+        const candle_end_ms = candle_start_ms + candle_duration_ms; // 15m candle end boundary
+        return candle_end_ms * 1_000_000; // back to ns
+    }
+
     fn updateUnrealizedPnL(self: *PortfolioManager) !void {
         self.total_unrealized_pnl = 0.0;
 
@@ -668,23 +689,25 @@ pub const PortfolioManager = struct {
             0.0;
 
         // Average profit/loss for signal strength categories
-        const strong_avg_profit = if (self.strong_signal_wins > 0)
+        const strong_signal_avg_profit_pct = if (self.strong_signal_wins > 0)
             self.strong_signal_total_profit_pct / @as(f64, @floatFromInt(self.strong_signal_wins))
         else
             0.0;
-        const strong_avg_loss = if (self.strong_signal_losses > 0)
+        const strong_signal_avg_loss_pct = if (self.strong_signal_losses > 0)
             self.strong_signal_total_loss_pct / @as(f64, @floatFromInt(self.strong_signal_losses))
         else
             0.0;
 
-        const normal_avg_profit = if (self.normal_signal_wins > 0)
+        const normal_signal_avg_profit_pct = if (self.normal_signal_wins > 0)
             self.normal_signal_total_profit_pct / @as(f64, @floatFromInt(self.normal_signal_wins))
         else
             0.0;
-        const normal_avg_loss = if (self.normal_signal_losses > 0)
+        const normal_signal_avg_loss_pct = if (self.normal_signal_losses > 0)
             self.normal_signal_total_loss_pct / @as(f64, @floatFromInt(self.normal_signal_losses))
         else
             0.0;
+
+        const portfolio_value = self.current_balance + self.total_unrealized_pnl;
 
         const open_positions = self.getOpenPositionsCount();
 
@@ -702,10 +725,10 @@ pub const PortfolioManager = struct {
             avg_profit_pct, avg_loss_pct, self.highest_profit_pct, self.lowest_loss_pct,
         });
         std.log.info("Strong Signals: {} trades | Win: {d:.1}% | Loss: {d:.1}% | Avg P: {d:.2}% | Avg L: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
-            self.strong_signal_trades, strong_win_rate, strong_loss_rate, strong_avg_profit, strong_avg_loss, self.strong_signal_highest_profit_pct, self.strong_signal_lowest_loss_pct,
+            self.strong_signal_trades, strong_win_rate, strong_loss_rate, strong_signal_avg_profit_pct, strong_signal_avg_loss_pct, self.strong_signal_highest_profit_pct, self.strong_signal_lowest_loss_pct,
         });
         std.log.info("Normal Signals: {} trades | Win: {d:.1}% | Loss: {d:.1}% | Avg P: {d:.2}% | Avg L: {d:.2}% | Best: {d:.2}% | Worst: {d:.2}%", .{
-            self.normal_signal_trades, normal_win_rate, normal_loss_rate, normal_avg_profit, normal_avg_loss, self.normal_signal_highest_profit_pct, self.normal_signal_lowest_loss_pct,
+            self.normal_signal_trades, normal_win_rate, normal_loss_rate, normal_signal_avg_profit_pct, normal_signal_avg_loss_pct, self.normal_signal_highest_profit_pct, self.normal_signal_lowest_loss_pct,
         });
         std.log.info("Open Positions: {} / {} | Available Balance: ${d:.2}", .{
             open_positions, self.max_positions, self.current_balance,
