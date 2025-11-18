@@ -58,56 +58,36 @@ pub const TickerHandler = struct {
         if (symbol_val != .string) return;
         const symbol = symbol_val.string;
 
-        const o_val = root.object.get("o") orelse return;
-        const h_val = root.object.get("h") orelse return;
-        const l_val = root.object.get("l") orelse return;
         const c_val = root.object.get("c") orelse return;
-        const v_val = root.object.get("v") orelse return;
         const e_val = root.object.get("E") orelse return;
 
-        if (o_val != .string or h_val != .string or l_val != .string or c_val != .string or v_val != .string or e_val != .integer) return;
+        if (c_val != .string or e_val != .integer) return;
 
-        const open_price = std.fmt.parseFloat(f64, o_val.string) catch |err| {
-            std.log.err("Failed to parse open price for {s}: {}", .{ symbol, err });
-            return;
-        };
-        const high_price = std.fmt.parseFloat(f64, h_val.string) catch |err| {
-            std.log.err("Failed to parse high price for {s}: {}", .{ symbol, err });
-            return;
-        };
-        const low_price = std.fmt.parseFloat(f64, l_val.string) catch |err| {
-            std.log.err("Failed to parse low price for {s}: {}", .{ symbol, err });
-            return;
-        };
         const close_price = std.fmt.parseFloat(f64, c_val.string) catch |err| {
             std.log.err("Failed to parse close price for {s}: {}", .{ symbol, err });
-            return;
-        };
-        const volume = std.fmt.parseFloat(f64, v_val.string) catch |err| {
-            std.log.err("Failed to parse volume for {s}: {}", .{ symbol, err });
             return;
         };
         const event_time_ms = e_val.integer;
 
         if (self.symbol_map.getPtr(symbol)) |sym| {
             const ohlc = OHLC{
-                .open_price = open_price,
-                .high_price = high_price,
-                .low_price = low_price,
+                .open_price = close_price,
+                .high_price = close_price,
+                .low_price = close_price,
                 .close_price = close_price,
-                .volume = volume,
+                .volume = 0.0,
             };
             self.mutex.lock();
             defer self.mutex.unlock();
             sym.addTicker(ohlc);
 
-            const current_candle_ms = @as(i64, @intCast((event_time_ms / 900000) * 900000));
+            const candle_ms = @as(i64, @intCast((event_time_ms / 900000) * 900000));
 
             if (sym.candle_start_time == 0) {
-                sym.initCandleWithPreviousClose(close_price, current_candle_ms);
-            } else if (current_candle_ms != sym.candle_start_time) {
+                sym.initCandleWithPreviousClose(close_price, candle_ms);
+            } else if (candle_ms != sym.candle_start_time) {
                 const prev_close = sym.current_price;
-                sym.startNewCandle(current_candle_ms);
+                sym.startNewCandle(candle_ms);
                 sym.current_price = prev_close;
             }
 
