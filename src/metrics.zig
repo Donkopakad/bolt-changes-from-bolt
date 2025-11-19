@@ -203,7 +203,7 @@ pub const MetricsCollector = struct {
     pub fn recordDepthMessage(self: *MetricsCollector, duration_us: f64) void {
         _ = self.depth_msg_count.fetchAdd(1, .acq_rel);
 
-@@ -244,50 +244,50 @@ pub const MetricsCollector = struct {
+                    pub const MetricsCollector = struct {
                     const depth_rate = @as(f64, @floatFromInt(depth_count)) / elapsed_seconds;
                     const depth_metric = MetricData{
                         .metric_type = .depth_handler_msg,
