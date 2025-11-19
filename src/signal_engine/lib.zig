@@ -58,10 +58,8 @@ pub const SignalEngine = struct {
         self.trade_handler.deinit();
         self.batch_queue.deinit();
 
-        if (self.stat_calc) |sc| {
-            sc.deinit();
-            self.allocator.destroy(sc);
-        }
+        self.stat_calc.deinit();
+        self.allocator.destroy(self.stat_calc);
     }
 
     pub fn run(self: *SignalEngine) !void {
