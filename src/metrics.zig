@@ -13,244 +13,115 @@ pub const MetricData = struct {
     timestamp: i64,
 };
 
-pub const SimpleLockFreeRingBuffer = struct {
-    buffer: []MetricData,
-    head: std.atomic.Value(u64),
-    tail: std.atomic.Value(u64),
-    capacity: u64,
-
-    pub fn init(allocator: std.mem.Allocator, size: u64) !SimpleLockFreeRingBuffer {
-        const capacity = std.math.ceilPowerOfTwo(u64, size) catch return error.TooLarge;
-        const buffer = try allocator.alloc(MetricData, capacity);
-        @memset(buffer, std.mem.zeroes(MetricData));
-
-        return SimpleLockFreeRingBuffer{
-            .buffer = buffer,
-            .head = std.atomic.Value(u64).init(0),
-            .tail = std.atomic.Value(u64).init(0),
-            .capacity = capacity,
-        };
-    }
-
-    pub fn deinit(self: *SimpleLockFreeRingBuffer, allocator: std.mem.Allocator) void {
-        allocator.free(self.buffer);
-    }
-
-    pub fn push(self: *SimpleLockFreeRingBuffer, item: MetricData) bool {
-        const current_tail = self.tail.load(.unordered);
-        const next_tail = (current_tail + 1) & (self.capacity - 1);
-        const current_head = self.head.load(.acquire);
-
-        if (next_tail == current_head) {
-            return false; // buffer full
-        }
-
-        self.buffer[current_tail] = item;
-        self.tail.store(next_tail, .release);
-        return true;
-    }
-
-    pub fn pop(self: *SimpleLockFreeRingBuffer) ?MetricData {
-        const current_head = self.head.load(.unordered);
-        const current_tail = self.tail.load(.acquire);
-
-        if (current_head == current_tail) {
-            return null; // buffer empty
-        }
-
-        const item = self.buffer[current_head];
-        const next_head = (current_head + 1) & (self.capacity - 1);
-        self.head.store(next_head, .release);
-
-        return item;
-    }
-
-    pub fn isEmpty(self: *SimpleLockFreeRingBuffer) bool {
-        return self.head.load(.acquire) == self.tail.load(.acquire);
-    }
-};
-
-// lock-free ring buffer using atomic operations
-pub const LockFreeRingBuffer = struct {
-    buffer: []MetricData,
-    head: std.atomic.Value(u64),
-    tail: std.atomic.Value(u64),
-    capacity: u64,
-
-    pub fn init(allocator: std.mem.Allocator, size: u64) !LockFreeRingBuffer {
-        const capacity = std.math.ceilPowerOfTwo(u64, size) catch return error.TooLarge;
-        const buffer = try allocator.alloc(MetricData, capacity);
-        @memset(buffer, std.mem.zeroes(MetricData));
-
-        return LockFreeRingBuffer{
-            .buffer = buffer,
-            .head = std.atomic.Value(u64).init(0),
-            .tail = std.atomic.Value(u64).init(0),
-            .capacity = capacity,
-        };
-    }
-
-    pub fn deinit(self: *LockFreeRingBuffer, allocator: std.mem.Allocator) void {
-        allocator.free(self.buffer);
-    }
-
-    pub fn push(self: *LockFreeRingBuffer, item: MetricData) bool {
-        var retries: u32 = 0;
-        while (retries < 1000) : (retries += 1) {
-            const current_tail = self.tail.load(.acquire);
-            const next_tail = (current_tail + 1) & (self.capacity - 1);
-            const current_head = self.head.load(.acquire);
-
-            if (next_tail == current_head) {
-                return false; // buffer full
-            }
-
-            if (self.tail.cmpxchgWeak(current_tail, next_tail, .acq_rel, .acquire)) |_| {
-                continue; // CAS failed, retry
-            }
-
-            self.buffer[current_tail] = item;
-            return true;
-        }
-        return false; // too many retries, likely contention issue
-    }
-
-    pub fn pop(self: *LockFreeRingBuffer) ?MetricData {
-        var retries: u32 = 0;
-        while (retries < 1000) : (retries += 1) {
-            const current_head = self.head.load(.acquire);
-            const current_tail = self.tail.load(.acquire);
-
-           if (current_head == current_tail) {
-                return null;
-            }
-
-            const item = self.buffer[current_head];
-            const next_head = (current_head + 1) & (self.capacity - 1);
-
-            if (self.head.cmpxchgWeak(current_head, next_head, .acq_rel, .acquire)) |_| {
-                continue; // CAS failed, retry
-            }
-
-            return item;
-        }
-        return null; // too many retries
-    }
-
-    pub fn isEmpty(self: *LockFreeRingBuffer) bool {
-        return self.head.load(.acquire) == self.tail.load(.acquire);
-    }
-};
-
 pub const MetricsChannel = struct {
     allocator: std.mem.Allocator,
-    ring_buffer: SimpleLockFreeRingBuffer,
-    run_flag: std.atomic.Value(bool),
+    storage: std.ArrayListUnmanaged(MetricData),
+    head_index: usize,
+    running: bool,
 
     pub fn init(allocator: std.mem.Allocator) !*MetricsChannel {
         const channel = try allocator.create(MetricsChannel);
-        const ring_buffer = try SimpleLockFreeRingBuffer.init(allocator, 90000);
-
         channel.* = MetricsChannel{
             .allocator = allocator,
-            .ring_buffer = ring_buffer,
-            .run_flag = std.atomic.Value(bool).init(true),
+            .storage = .{},
+            .head_index = 0,
+            .running = true,
         };
         return channel;
     }
 
     pub fn deinit(self: *MetricsChannel) void {
-        self.ring_buffer.deinit(self.allocator);
+        self.storage.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
     pub fn send(self: *MetricsChannel, metric: MetricData) bool {
-        return self.ring_buffer.push(metric);
+        if (!self.running) return false;
+        self.storage.append(self.allocator, metric) catch return false;
+        return true;
     }
 
     pub fn receive(self: *MetricsChannel) ?MetricData {
-        return self.ring_buffer.pop();
+        if (self.head_index >= self.storage.items.len) {
+            return null;
+        }
+
+        const metric = self.storage.items[self.head_index];
+        self.head_index += 1;
+        if (self.head_index >= self.storage.items.len) {
+            self.storage.clearRetainingCapacity();
+            self.head_index = 0;
+        }
+        return metric;
     }
 
     pub fn stop(self: *MetricsChannel) void {
-        self.run_flag.store(false, .release);
+        self.running = false;
     }
 
     pub fn isRunning(self: *MetricsChannel) bool {
-        return self.run_flag.load(.acquire);
+        return self.running;
     }
 
     pub fn hasData(self: *MetricsChannel) bool {
-        return !self.ring_buffer.isEmpty();
+        return self.head_index < self.storage.items.len;
     }
 };
 
 pub const MetricsCollector = struct {
-    depth_msg_count: std.atomic.Value(u64),
-    ticker_msg_count: std.atomic.Value(u64),
-    last_reset_time: std.atomic.Value(i64),
     channel: *MetricsChannel,
+    depth_msg_count: usize,
+    ticker_msg_count: usize,
 
     pub fn init(channel: *MetricsChannel) MetricsCollector {
         return MetricsCollector{
-            .depth_msg_count = std.atomic.Value(u64).init(0),
-            .ticker_msg_count = std.atomic.Value(u64).init(0),
-            .last_reset_time = std.atomic.Value(i64).init(std.time.milliTimestamp()),
             .channel = channel,
+            .depth_msg_count = 0,
+            .ticker_msg_count = 0,
         };
     }
 
     pub fn recordDepthMessage(self: *MetricsCollector, duration_us: f64) void {
-        _ = self.depth_msg_count.fetchAdd(1, .acq_rel);
+        _ = duration_us;
+        self.depth_msg_count += 1;
+    }
 
-                    pub const MetricsCollector = struct {
-                    const depth_rate = @as(f64, @floatFromInt(depth_count)) / elapsed_seconds;
-                    const depth_metric = MetricData{
-                        .metric_type = .depth_handler_msg,
-                        .value = depth_rate,
-                        .timestamp = current_time,
-                    };
-                    _ = self.channel.send(depth_metric);
-                }
+    pub fn recordTickerMessage(self: *MetricsCollector, duration_us: f64) void {
+        _ = duration_us;
+        self.ticker_msg_count += 1;
+    }
 
-                if (ticker_count > 0) {
-                    const ticker_rate = @as(f64, @floatFromInt(ticker_count)) / elapsed_seconds;
-                    const ticker_metric = MetricData{
-                        .metric_type = .ticker_handler_msg,
-                        .value = ticker_rate,
-                        .timestamp = current_time,
-                    };
-                    _ = self.channel.send(ticker_metric);
-                }
-            }
+    pub fn flush(self: *MetricsCollector) void {
+        const timestamp = std.time.microTimestamp();
+
+        if (self.depth_msg_count > 0) {
+            const metric = MetricData{
+                .metric_type = .depth_handler_msg,
+                .value = @floatFromInt(self.depth_msg_count),
+                .timestamp = timestamp,
+            };
+            _ = self.channel.send(metric);
+            self.depth_msg_count = 0;
+        }
+
+        if (self.ticker_msg_count > 0) {
+            const metric = MetricData{
+                .metric_type = .ticker_handler_msg,
+                .value = @floatFromInt(self.ticker_msg_count),
+                .timestamp = timestamp,
+            };
+            _ = self.channel.send(metric);
+            self.ticker_msg_count = 0;
         }
     }
 };
 
 pub fn metricsThread(channel: *MetricsChannel) void {
-    std.debug.print("Metrics thread started\n", .{});
-    while (channel.isRunning()) {
-        while (channel.receive()) |metric| {
-            switch (metric.metric_type) {
-                .depth_handler_msg => {
-                    std.debug.print("DepthHandler messages per second: {d:.2}\n", .{metric.value});
-                },
-                .ticker_handler_msg => {
-                    std.debug.print("TickerHandler messages per second: {d:.2}\n", .{metric.value});
-                },
-                .depth_handler_duration => {
-                    //std.debug.print("DepthHandler.serverMessage took: {d:.2} μs\n", .{metric.value});
-                },
-                .ticker_handler_duration => {
-                    //std.debug.print("TickerHandler.serverMessage took: {d:.2} μs\n", .{metric.value});
-                },
-            }
-        }
-
-        if (!channel.hasData()) {
-            std.time.sleep(1000000);
+    while (channel.isRunning() or channel.hasData()) {
+        if (channel.receive()) |_| {
+            // Metrics are intentionally ignored in this stub implementation.
+        } else {
+            std.time.sleep(100_000_000);
         }
     }
-
-    std.debug.print("Metrics thread stopped\n", .{});
 }
