@@ -205,7 +205,8 @@ pub const PortfolioManager = struct {
         }
         const duration_ms = @divFloor(self.candle_duration_ns, 1_000_000);
         const ts_ms = @divFloor(timestamp_ns, 1_000_000);
-        const start_ms = (ts_ms / duration_ms) * duration_ms;
+        const bucket = @divTrunc(ts_ms, duration_ms);
+        const start_ms = bucket * duration_ms;
         return start_ms * 1_000_000;
     }
 };
