@@ -53,8 +53,8 @@ const CudaWrapper = struct {
     }
 
     fn allocateMemory(d_ohlc_batch: **GPUOHLCDataBatch, d_pct_result: **GPUPercentageChangeDeviceBatch) ERR.KernelError {
-        d_ohlc_batch.* = null;
-        d_pct_result.* = null;
+        d_ohlc_batch.*.* = std.mem.zeroes(GPUOHLCDataBatch);
+        d_pct_result.*.* = std.mem.zeroes(GPUPercentageChangeDeviceBatch);
         return success();
     }
 
