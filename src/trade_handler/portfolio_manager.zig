@@ -125,7 +125,10 @@ pub const PortfolioManager = struct {
         const leverage = if (signal.leverage > 0) signal.leverage else 1.0;
         const position_size_usdt = @as(f64, @floatCast(@max(10.0, self.balance_usdt * 0.05))) * @as(f64, @floatCast(leverage));
         if (self.balance_usdt < position_size_usdt) {
-            std.log.warn("Insufficient balance to open {s} {s}", .{ side == .long ? "LONG" : "SHORT", signal.symbol_name });
+            std.log.warn(
+    "Insufficient balance to open {s} {s}",
+    .{ if (side == .long) "LONG" else "SHORT", signal.symbol_name },
+     );
             return;
         }
 
