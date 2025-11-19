@@ -81,7 +81,8 @@ pub const TickerHandler = struct {
             defer self.mutex.unlock();
             sym.addTicker(ohlc);
 
-            const candle_ms = @as(i64, @intCast((event_time_ms / 900000) * 900000));
+            const bucket = @divTrunc(event_time_ms, 900000);
+            const candle_ms = @as(i64, @intCast(bucket * 900000));
 
             if (sym.candle_start_time == 0) {
                 sym.initCandleWithPreviousClose(close_price, candle_ms);
