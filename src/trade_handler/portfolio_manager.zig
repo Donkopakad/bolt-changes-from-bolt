@@ -127,7 +127,7 @@ pub const PortfolioManager = struct {
         if (self.balance_usdt < position_size_usdt) {
             std.log.warn(
                 "Insufficient balance to open {s} {s}",
-                .{ if (side == .long) "LONG" else "SHORT", signal.symbol_name },
+                .{ (if (side == .long) "LONG" else "SHORT"), signal.symbol_name },
             );
             return;
         }
@@ -156,7 +156,7 @@ pub const PortfolioManager = struct {
 
         self.balance_usdt -= position_size_usdt;
         std.log.info("Opened {s} on {s} at ${d:.4} size ${d:.2} candle_end={d}", .{
-            side == .long ? "LONG" : "SHORT",
+            if (side == .long) "LONG" else "SHORT",
             signal.symbol_name,
             price,
             position_size_usdt,
