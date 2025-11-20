@@ -78,7 +78,7 @@ pub const TradeLogger = struct {
             ++ "candle_close_at_exit,pnl_usdt,pct_entry,pct_exit\n";
 
         try self.file.writeAll(header);
-        try self.file.flush();
+        try self.file.sync();
     }
 
     // -------------------------------------------------------------------------
@@ -216,7 +216,7 @@ pub const TradeLogger = struct {
             },
         );
 
-        try self.file.flush();
+        try self.file.sync();
     }
 };
 
