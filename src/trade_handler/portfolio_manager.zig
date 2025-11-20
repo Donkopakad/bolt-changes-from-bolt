@@ -98,7 +98,68 @@ pub const PortfolioManager = struct {
             if (now_ns >= position.candle_end_timestamp) {
                 try to_close.append(entry.key_ptr.*);
             }
-@@ -140,73 +163,202 @@ pub const PortfolioManager = struct {
+        }
+
+        for (to_close.items) |sym_name| {
+            if (self.positions.getPtr(sym_name)) |pos| {
+                const price = try symbol_map.getLastClosePrice(self.symbol_map, sym_name);
+                if (pos.side == .long) {
+                    self.closeLong(pos, price);
+                } else if (pos.side == .short) {
+                    self.closeShort(pos, price);
+                }
+            }
+        }
+    }
+
+    fn executeBuy(self: *PortfolioManager, signal: TradingSignal, price: f64) void {
+        self.margin_enforcer.ensureIsolatedMargin(signal.symbol_name) catch |err| {
+            std.log.err("Failed to enforce isolated margin for {s}: {}", .{ signal.symbol_name, err });
+            return;
+        };
+
+        if (self.positions.getPtr(signal.symbol_name)) |pos| {
+            if (pos.is_open and pos.side == .short) {
+                self.closeShort(pos, price);
+            }
+            return;
+        }
+
+        self.openPosition(signal, price, .long);
+    }
+
+    fn executeSell(self: *PortfolioManager, signal: TradingSignal, price: f64) void {
+        self.margin_enforcer.ensureIsolatedMargin(signal.symbol_name) catch |err| {
+            std.log.err("Failed to enforce isolated margin for {s}: {}", .{ signal.symbol_name, err });
+            return;
+        };
+
+        if (self.positions.getPtr(signal.symbol_name)) |pos| {
+            if (pos.is_open and pos.side == .long) {
+                self.closeLong(pos, price);
+            }
+            return;
+        }
+
+        self.openPosition(signal, price, .short);
+    }
+
+    fn openPosition(self: *PortfolioManager, signal: TradingSignal, price: f64, side: PositionSide) void {
+        const leverage = if (signal.leverage > 0) signal.leverage else 1.0;
+        const position_size_usdt = @as(f64, @floatCast(@max(10.0, self.balance_usdt * 0.05))) * @as(f64, @floatCast(leverage));
+        if (self.balance_usdt < position_size_usdt) {
+            std.log.warn(
+                "Insufficient balance to open {s} {s}",
+                .{ (if (side == .long) "LONG" else "SHORT"), signal.symbol_name },
+            );
+            return;
+        }
+
+        const amount = position_size_usdt / (price * (1.0 + self.fee_rate));
+        const candle_start_ns = self.currentCandleStart(signal.symbol_name, signal.timestamp);
+        const candle_end_ns = candle_start_ns + self.candle_duration_ns;
+
+        const position = PortfolioPosition{
             .symbol = signal.symbol_name,
             .amount = amount,
             .avg_entry_price = price,
