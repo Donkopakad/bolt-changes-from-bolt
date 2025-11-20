@@ -226,3 +226,4 @@ pub const TradeLogger = struct {
 pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
     const secs: i128 = @divFloor(timestamp_ns, 1_000_000_000);
     return try std.fmt.bufPrint(buffer, "{d}", .{secs});
+}
