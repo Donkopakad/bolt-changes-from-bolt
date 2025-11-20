@@ -1,9 +1,16 @@
 const std = @import("std");
 
+// ============================================================================
+// Trade Logger
+// ============================================================================
+
 pub const TradeLogger = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
 
+    // ------------------------------------------------------------------------
+    // TradeRow structure
+    // ------------------------------------------------------------------------
     pub const TradeRow = struct {
         event_time_ns: i128,
         event_type: []const u8,
@@ -27,18 +34,32 @@ pub const TradeLogger = struct {
         pct_exit: f64,
     };
 
+    // ------------------------------------------------------------------------
+    // Initialize logger
+    // ------------------------------------------------------------------------
     pub fn init(allocator: std.mem.Allocator) !*TradeLogger {
+        // ensure directory exists
         try std.fs.cwd().makePath("logs");
 
         const path = "logs/trades.csv";
-        const file = std.fs.cwd().openFile(path, .{ .mode = .write_only, .append = true }) catch |err| switch (err) {
+
+        // open file in read_write (Zig 0.14 supports only .mode & .lock)
+        var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try std.fs.cwd().createFile(path, .{}),
             else => return err,
         };
 
-        const logger = try allocator.create(TradeLogger);
-        logger.* = .{ .allocator = allocator, .file = file };
+        // move to file end to append
+        try file.seekToEnd();
 
+        // allocate logger
+        const logger = try allocator.create(TradeLogger);
+        logger.* = .{
+            .allocator = allocator,
+            .file = file,
+        };
+
+        // check if header needed
         const meta = try logger.file.metadata();
         if (meta.size == 0) {
             try logger.writeHeader();
@@ -52,12 +73,23 @@ pub const TradeLogger = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn writeHeader(self: *TradeLogger) !void {
-        const header = "event_time_utc,event_type,symbol,side,leverage,amount,position_size_usdt,fee_rate,entry_price,exit_price,candle_start_utc,candle_end_utc,candle_open,candle_high,candle_low,candle_close_at_entry,candle_close_at_exit,pnl_usdt,pct_entry,pct_exit\n";
+    // ------------------------------------------------------------------------
+    // Header Writer
+    // ------------------------------------------------------------------------
+    fn writeHeader(self: *TradeLogger) !void {
+        const header =
+            "event_time_utc,event_type,symbol,side,leverage,amount,position_size_usdt,"
+            ++ "fee_rate,entry_price,exit_price,candle_start_utc,candle_end_utc,"
+            ++ "candle_open,candle_high,candle_low,candle_close_at_entry,"
+            ++ "candle_close_at_exit,pnl_usdt,pct_entry,pct_exit\n";
+
         try self.file.writeAll(header);
         try self.file.flush();
     }
 
+    // ------------------------------------------------------------------------
+    // PUBLIC: Log OPEN trade
+    // ------------------------------------------------------------------------
     pub fn logOpenTrade(
         self: *TradeLogger,
         event_time_ns: i128,
@@ -101,6 +133,9 @@ pub const TradeLogger = struct {
         try self.writeTradeRow(row);
     }
 
+    // ------------------------------------------------------------------------
+    // PUBLIC: Log CLOSE trade
+    // ------------------------------------------------------------------------
     pub fn logCloseTrade(
         self: *TradeLogger,
         event_time_ns: i128,
@@ -147,21 +182,24 @@ pub const TradeLogger = struct {
         try self.writeTradeRow(row);
     }
 
-    pub fn writeTradeRow(self: *TradeLogger, row: TradeRow) !void {
-        var time_buf: [64]u8 = undefined;
-        const event_time = try formatTimestamp(row.event_time_ns, &time_buf);
+    // ------------------------------------------------------------------------
+    // Write a single CSV row
+    // ------------------------------------------------------------------------
+    fn writeTradeRow(self: *TradeLogger, row: TradeRow) !void {
+        var buf1: [64]u8 = undefined;
+        var buf2: [64]u8 = undefined;
+        var buf3: [64]u8 = undefined;
 
-        var candle_start_buf: [64]u8 = undefined;
-        const candle_start = try formatTimestamp(row.candle_start_ns, &candle_start_buf);
+        const t_event = try formatTimestamp(row.event_time_ns, &buf1);
+        const t_start = try formatTimestamp(row.candle_start_ns, &buf2);
+        const t_end = try formatTimestamp(row.candle_end_ns, &buf3);
 
-        var candle_end_buf: [64]u8 = undefined;
-        const candle_end = try formatTimestamp(row.candle_end_ns, &candle_end_buf);
+        const w = self.file.writer();
 
-        const writer = self.file.writer();
-        try writer.print(
-            "{s},{s},{s},{s},{d:.4},{d:.4},{d:.4},{d:.6},{d:.4},{d:.4},{s},{s},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4}\n",
+        try w.print(
+            "{s},{s},{s},{s},{d},{d},{d},{d},{d},{d},{s},{s},{d},{d},{d},{d},{d},{d},{d},{d}\n",
             .{
-                event_time,
+                t_event,
                 row.event_type,
                 row.symbol,
                 row.side,
@@ -171,8 +209,8 @@ pub const TradeLogger = struct {
                 row.fee_rate,
                 row.entry_price,
                 row.exit_price,
-                candle_start,
-                candle_end,
+                t_start,
+                t_end,
                 row.candle_open,
                 row.candle_high,
                 row.candle_low,
@@ -183,16 +221,30 @@ pub const TradeLogger = struct {
                 row.pct_exit,
             },
         );
+
         try self.file.flush();
     }
 };
 
+// ============================================================================
+// Timestamp formatter — Zig 0.14.0 compatible
+// ============================================================================
 pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
     const secs: i64 = @intCast(@divFloor(timestamp_ns, 1_000_000_000));
-    const dt = try std.time.utc.timestampToDateTime(secs);
+
+    // Zig 0.14 equivalent
+    const dt = try std.time.timestampToDateTime(secs);
+
     return try std.fmt.bufPrint(
         buffer,
         "{d}-{02d}-{02d}T{02d}:{02d}:{02d}Z",
-        .{ dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second },
+        .{
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second,
+        },
     );
 }
