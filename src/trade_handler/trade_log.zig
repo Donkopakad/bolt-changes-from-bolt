@@ -24,7 +24,7 @@ pub const TradeLogger = struct {
         exit_price: f64,
         candle_start_ns: i128,
         candle_end_ns: i128,
-        candle_open: f64,
+         candle_open: f64,
         candle_high: f64,
         candle_low: f64,
         candle_close_at_entry: f64,
@@ -49,8 +49,9 @@ pub const TradeLogger = struct {
             else => return err,
         };
 
-        // move to file end to append
-        try file.seekToEnd();
+        // move to file end to append (0.14 compat)
+        const end_pos = try file.getEndPos();
+        try file.seekTo(end_pos);
 
         // allocate logger
         const logger = try allocator.create(TradeLogger);
@@ -232,19 +233,19 @@ pub const TradeLogger = struct {
 pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
     const secs: i64 = @intCast(@divFloor(timestamp_ns, 1_000_000_000));
 
-    // Zig 0.14 equivalent
-    const dt = try std.time.timestampToDateTime(secs);
+    // Zig 0.14 compatible gmtime conversion
+    const dt = std.time.gmtime(secs);
 
     return try std.fmt.bufPrint(
         buffer,
         "{d}-{02d}-{02d}T{02d}:{02d}:{02d}Z",
         .{
-            dt.year,
-            dt.month,
-            dt.day,
+            dt.year + 1900,
+            dt.mon + 1,
+            dt.mday,
             dt.hour,
-            dt.minute,
-            dt.second,
+            dt.min,
+            dt.sec,
         },
     );
 }
