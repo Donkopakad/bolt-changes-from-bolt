@@ -5,24 +5,24 @@ pub const TradeEventType = enum { open, close };
 pub const TradeLogger = struct {
     file: std.fs.File,
 
-    // ---------------------------------------------------------------
-    // INIT LOGGER - Zig 0.14 compatible
-    // ---------------------------------------------------------------
+    // ============================================================
+    // INIT
+    // ============================================================
     pub fn init(allocator: std.mem.Allocator) !*TradeLogger {
         var logger = try allocator.create(TradeLogger);
         errdefer allocator.destroy(logger);
 
         try std.fs.cwd().makePath("logs");
 
-        // Only valid flags in Zig 0.14:
-        // .read, .write, .append, .truncate, .exclusive, .read_write
         logger.file = try std.fs.cwd().openFile("logs/trades.csv", .{
+            .read = false,
             .write = true,
             .append = true,
+            .truncate = false,
         });
 
-        const meta = try logger.file.metadata();
-        if (meta.size == 0) {
+        const metadata = try logger.file.metadata();
+        if (metadata.size == 0) {
             try logger.writeHeader();
         }
 
@@ -33,39 +33,35 @@ pub const TradeLogger = struct {
         self.file.close();
     }
 
-    // ---------------------------------------------------------------
-    // CSV HEADER
-    // ---------------------------------------------------------------
+    // ============================================================
     fn writeHeader(self: *TradeLogger) !void {
         try self.file.writeAll(
             "event_time_utc,event_type,symbol,side,leverage,amount,position_size_usdt,fee_rate,"
-            ++ "entry_price,exit_price,candle_start_time_utc,candle_end_time_utc,"
+            ++ "entry_price,exit_price,candle_start_utc,candle_end_utc,"
             ++ "candle_open,candle_high,candle_low,candle_close_at_entry,candle_close_at_exit,"
-            ++ "pnl_usdt,pct_change_from_open_at_entry,pct_change_from_open_at_exit\n"
+            ++ "pnl_usdt,pct_entry,pct_exit\n"
         );
         try self.file.flush();
     }
 
-    // ---------------------------------------------------------------
-    // FORMAT TIMESTAMP - Zig 0.14 uses std.time.printIso8601
-    // ---------------------------------------------------------------
-    fn formatTimestamp(buffer: []u8, ts_ns: i128) ![]const u8 {
-        const secs = @divTrunc(ts_ns, 1_000_000_000);
-        const nsecs = @as(u32, @intCast(ts_ns - (secs * 1_000_000_000)));
+    // ============================================================
+    // TIMESTAMP FORMATTER (Zig 0.14 manual formatter)
+    // ============================================================
+    fn formatTimestamp(buffer: []u8, timestamp_ns: i128) ![]const u8 {
+        const epoch_s: i64 = @intCast(timestamp_ns / 1_000_000_000);
 
-        return try std.time.printIso8601(
+        const dt = try std.time.utcToDateTime(epoch_s);
+
+        return try std.fmt.bufPrint(
             buffer,
-            .{
-                .secs = @as(i64, @intCast(secs)),
-                .nsecs = nsecs,
-                .utc = true,
-            },
+            "{d:04}-{d:02}-{d:02}T{d:02}:{d:02}:{d:02}Z",
+            .{ dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second },
         );
     }
 
-    // ---------------------------------------------------------------
-    // INTERNAL GENERIC CSV WRITER
-    // ---------------------------------------------------------------
+    // ============================================================
+    // GENERIC TRADE ROW WRITER
+    // ============================================================
     fn writeTradeRow(
         self: *TradeLogger,
         event_time: i128,
@@ -89,18 +85,18 @@ pub const TradeLogger = struct {
         pct_entry: f64,
         pct_exit: f64,
     ) !void {
-        var buf_ts: [64]u8 = undefined;
-        var buf_cs: [64]u8 = undefined;
-        var buf_ce: [64]u8 = undefined;
+        var ts_buf: [64]u8 = undefined;
+        var start_buf: [64]u8 = undefined;
+        var end_buf: [64]u8 = undefined;
 
-        const ts_str = try formatTimestamp(&buf_ts, event_time);
-        const cs_str = try formatTimestamp(&buf_cs, candle_start_ns);
-        const ce_str = try formatTimestamp(&buf_ce, candle_end_ns);
+        const ts = try formatTimestamp(&ts_buf, event_time);
+        const start = try formatTimestamp(&start_buf, candle_start_ns);
+        const end = try formatTimestamp(&end_buf, candle_end_ns);
 
         try self.file.writer().print(
             "{s},{s},{s},{s},{d:.2},{d:.8},{d:.8},{d:.6},{d:.8},{d:.8},{s},{s},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8}\n",
             .{
-                ts_str,
+                ts,
                 if (event_type == .open) "OPEN" else "CLOSE",
                 symbol,
                 side,
@@ -110,8 +106,8 @@ pub const TradeLogger = struct {
                 fee_rate,
                 entry_price,
                 exit_price,
-                cs_str,
-                ce_str,
+                start,
+                end,
                 candle_open,
                 candle_high,
                 candle_low,
@@ -122,12 +118,13 @@ pub const TradeLogger = struct {
                 pct_exit,
             },
         );
+
         try self.file.flush();
     }
 
-    // ---------------------------------------------------------------
-    // PUBLIC: OPEN TRADE
-    // ---------------------------------------------------------------
+    // ============================================================
+    // PUBLIC — LOG OPEN
+    // ============================================================
     pub fn logOpenTrade(
         self: *TradeLogger,
         event_time: i128,
@@ -167,12 +164,14 @@ pub const TradeLogger = struct {
             0.0,
             pct_entry,
             0.0,
-        ) catch {};
+        ) catch |err| {
+            std.log.err("Failed to log OPEN trade: {}", .{err});
+        };
     }
 
-    // ---------------------------------------------------------------
-    // PUBLIC: CLOSE TRADE
-    // ---------------------------------------------------------------
+    // ============================================================
+    // PUBLIC — LOG CLOSE
+    // ============================================================
     pub fn logCloseTrade(
         self: *TradeLogger,
         event_time: i128,
@@ -215,6 +214,8 @@ pub const TradeLogger = struct {
             pnl_usdt,
             pct_entry,
             pct_exit,
-        ) catch {};
+        ) catch |err| {
+            std.log.err("Failed to log CLOSE trade: {}", .{err});
+        };
     }
 };
