@@ -154,7 +154,7 @@ pub const TradeLogger = struct {
         try self.writeTradeRow("close", row);
     }
 
-fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !void {
+    fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !void {
         var buffer: [64]u8 = undefined;
         const event_time = try formatTimestamp(row.event_time_ns, &buffer);
 
@@ -191,6 +191,10 @@ fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !voi
             },
         );
         try self.file.flush();
+    }
+
+    fn formatTimestamp(ns: i64, buffer: *[64]u8) ![]const u8 {
+        return try std.fmt.bufPrint(buffer, "{d}", .{ns});
     }
 };
 
