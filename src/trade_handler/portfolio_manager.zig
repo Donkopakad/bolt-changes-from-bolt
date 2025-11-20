@@ -209,7 +209,9 @@ pub const PortfolioManager = struct {
                 candle_snapshot.low,
                 price,
                 pct_change_from_open_at_entry,
-            );
+            ) catch |err| {
+                std.log.err("Failed to log open trade: {}", .{err});
+            };
         }
     }
 
@@ -255,7 +257,9 @@ pub const PortfolioManager = struct {
                 pnl,
                 pct_change_from_open_at_entry,
                 pct_change_from_open_at_exit,
-            );
+            ) catch |err| {
+                std.log.err("Failed to log close trade: {}", .{err});
+            };
         }
     }
 
@@ -301,7 +305,9 @@ pub const PortfolioManager = struct {
                 pnl,
                 pct_change_from_open_at_entry,
                 pct_change_from_open_at_exit,
-            );
+            ) catch |err| {
+                std.log.err("Failed to log close trade: {}", .{err});
+            };
         }
     }
 
