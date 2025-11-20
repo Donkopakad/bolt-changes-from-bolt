@@ -35,15 +35,19 @@ pub const TradeLogger = struct {
             .write = true,
             .append = true,
             .truncate = false,
+            .lock = false,
+            .executable = false,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
-                const created = try std.fs.cwd().createFile("logs/trades.csv", .{ .truncate = false });
+                const created = try std.fs.cwd().createFile("logs/trades.csv", .{});
                 created.close();
                 break :blk try std.fs.cwd().openFile("logs/trades.csv", .{
                     .read = false,
                     .write = true,
                     .append = true,
                     .truncate = false,
+                    .lock = false,
+                    .executable = false,
                 });
             },
             else => return err,
@@ -61,6 +65,7 @@ pub const TradeLogger = struct {
 
     pub fn deinit(self: *TradeLogger) void {
         self.file.close();
+        self.allocator.destroy(self);
     }
 
     pub fn writeHeader(self: *TradeLogger) !void {
@@ -202,8 +207,8 @@ pub const TradeLogger = struct {
 };
 
 pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
-    const secs: i128 = @divTrunc(timestamp_ns, 1_000_000_000);
-    const dt = try std.time.utcToDateTime(@as(i64, @intCast(secs)));
+    const secs: i64 = @intCast(@divTrunc(timestamp_ns, 1_000_000_000));
+    var dt = try std.time.utc.timestampToDateTime(secs);
     return try std.fmt.bufPrint(
         buffer,
         "{d:04}-{d:02}-{d:02}T{d:02}:{d:02}:{d:02}Z",
