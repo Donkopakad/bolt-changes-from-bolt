@@ -30,17 +30,14 @@ pub const TradeLogger = struct {
     pub fn init(allocator: std.mem.Allocator) !*TradeLogger {
         try std.fs.cwd().makePath("logs");
 
-        const file = try std.fs.cwd().openFile("logs/trades.csv", .{
-            .mode = .write_only,
-            .create = true,
-            .append = true,
-        });
+        const path = "logs/trades.csv";
+        const file = std.fs.cwd().openFile(path, .{ .mode = .write_only, .append = true }) catch |err| switch (err) {
+            error.FileNotFound => try std.fs.cwd().createFile(path, .{}),
+            else => return err,
+        };
 
         const logger = try allocator.create(TradeLogger);
-        logger.* = TradeLogger{
-            .allocator = allocator,
-            .file = file,
-        };
+        logger.* = .{ .allocator = allocator, .file = file };
 
         const meta = try logger.file.metadata();
         if (meta.size == 0) {
@@ -162,7 +159,7 @@ pub const TradeLogger = struct {
 
         const writer = self.file.writer();
         try writer.print(
-            "{s},{s},{s},{s},{d:.4},{d:.4},{d:.4},{d:.6},{d:.4},{d:.4},{s},{s},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4}\n",
+            "{s},{s},{s},{s},{d:.4},{d:.4},{d:.4},{d:.6},{d:.4},{d:.4},{s},{s},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4}\n",
             .{
                 event_time,
                 row.event_type,
@@ -192,7 +189,7 @@ pub const TradeLogger = struct {
 
 pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
     const secs: i64 = @intCast(@divFloor(timestamp_ns, 1_000_000_000));
-    const dt = try std.time.DateTime.parse(.unix, secs);
+    const dt = try std.time.utc.timestampToDateTime(secs);
     return try std.fmt.bufPrint(
         buffer,
         "{d}-{02d}-{02d}T{02d}:{02d}:{02d}Z",
