@@ -32,14 +32,12 @@ pub const TradeLogger = struct {
 
         var file: std.fs.File = cwd.openFile("logs/trades.csv", .{
             .mode = .read_write,
-            .intended_io_mode = .blocking,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 var created = try cwd.createFile("logs/trades.csv", .{ .truncate = false });
                 created.close();
                 break :blk try cwd.openFile("logs/trades.csv", .{
                     .mode = .read_write,
-                    .intended_io_mode = .blocking,
                 });
             },
             else => return err,
@@ -197,14 +195,4 @@ fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !voi
 };
 
 fn formatTimestamp(ns: i64, buffer: *[64]u8) ![]const u8 {
-    const seconds: i64 = @divTrunc(ns, 1_000_000_000);
-    const dt = try std.time.utcToDateTime(seconds);
-    return try std.fmt.bufPrint(buffer, "{d:04}-{d:02}-{d:02}T{d:02}:{d:02}:{d:02}Z", .{
-        dt.year,
-        dt.month,
-        dt.day,
-        dt.hour,
-        dt.minute,
-        dt.second,
-    });
-}
+    return try std.fmt.bufPrint(buffer, "{d}", .{ns});
