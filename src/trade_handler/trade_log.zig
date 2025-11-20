@@ -5,25 +5,24 @@ pub const TradeEventType = enum { open, close };
 pub const TradeLogger = struct {
     file: std.fs.File,
 
-    // ============================================================
-    // INITIALIZE LOGGER (Zig 0.14 compatible)
-    // ============================================================
+    // ---------------------------------------------------------------
+    // INIT LOGGER - Zig 0.14 compatible
+    // ---------------------------------------------------------------
     pub fn init(allocator: std.mem.Allocator) !*TradeLogger {
         var logger = try allocator.create(TradeLogger);
         errdefer allocator.destroy(logger);
 
         try std.fs.cwd().makePath("logs");
 
-        // Zig 0.14 — valid flags:
-        // .read_only, .write_only, .read_write, .append, .truncate
+        // Only valid flags in Zig 0.14:
+        // .read, .write, .append, .truncate, .exclusive, .read_write
         logger.file = try std.fs.cwd().openFile("logs/trades.csv", .{
-            .write_only = true,
+            .write = true,
             .append = true,
         });
 
-        // Write header only if file is empty
-        const metadata = try logger.file.metadata();
-        if (metadata.size == 0) {
+        const meta = try logger.file.metadata();
+        if (meta.size == 0) {
             try logger.writeHeader();
         }
 
@@ -34,9 +33,9 @@ pub const TradeLogger = struct {
         self.file.close();
     }
 
-    // ============================================================
+    // ---------------------------------------------------------------
     // CSV HEADER
-    // ============================================================
+    // ---------------------------------------------------------------
     fn writeHeader(self: *TradeLogger) !void {
         try self.file.writeAll(
             "event_time_utc,event_type,symbol,side,leverage,amount,position_size_usdt,fee_rate,"
@@ -47,23 +46,26 @@ pub const TradeLogger = struct {
         try self.file.flush();
     }
 
-    // ============================================================
-    // FORMAT TIMESTAMP — Zig 0.14 compatible
-    // ============================================================
+    // ---------------------------------------------------------------
+    // FORMAT TIMESTAMP - Zig 0.14 uses std.time.printIso8601
+    // ---------------------------------------------------------------
     fn formatTimestamp(buffer: []u8, ts_ns: i128) ![]const u8 {
         const secs = @divTrunc(ts_ns, 1_000_000_000);
         const nsecs = @as(u32, @intCast(ts_ns - (secs * 1_000_000_000)));
 
-        return try std.time.formatIso8601(buffer, .{
-            .secs = @as(i64, @intCast(secs)),
-            .nsecs = nsecs,
-            .utc = true,
-        });
+        return try std.time.printIso8601(
+            buffer,
+            .{
+                .secs = @as(i64, @intCast(secs)),
+                .nsecs = nsecs,
+                .utc = true,
+            },
+        );
     }
 
-    // ============================================================
-    // INTERNAL CSV ROW WRITER
-    // ============================================================
+    // ---------------------------------------------------------------
+    // INTERNAL GENERIC CSV WRITER
+    // ---------------------------------------------------------------
     fn writeTradeRow(
         self: *TradeLogger,
         event_time: i128,
@@ -87,13 +89,13 @@ pub const TradeLogger = struct {
         pct_entry: f64,
         pct_exit: f64,
     ) !void {
-        var ts_buf: [64]u8 = undefined;
-        var cs_buf: [64]u8 = undefined;
-        var ce_buf: [64]u8 = undefined;
+        var buf_ts: [64]u8 = undefined;
+        var buf_cs: [64]u8 = undefined;
+        var buf_ce: [64]u8 = undefined;
 
-        const ts_str = try formatTimestamp(&ts_buf, event_time);
-        const start_str = try formatTimestamp(&cs_buf, candle_start_ns);
-        const end_str = try formatTimestamp(&ce_buf, candle_end_ns);
+        const ts_str = try formatTimestamp(&buf_ts, event_time);
+        const cs_str = try formatTimestamp(&buf_cs, candle_start_ns);
+        const ce_str = try formatTimestamp(&buf_ce, candle_end_ns);
 
         try self.file.writer().print(
             "{s},{s},{s},{s},{d:.2},{d:.8},{d:.8},{d:.6},{d:.8},{d:.8},{s},{s},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8}\n",
@@ -108,8 +110,8 @@ pub const TradeLogger = struct {
                 fee_rate,
                 entry_price,
                 exit_price,
-                start_str,
-                end_str,
+                cs_str,
+                ce_str,
                 candle_open,
                 candle_high,
                 candle_low,
@@ -120,13 +122,12 @@ pub const TradeLogger = struct {
                 pct_exit,
             },
         );
-
         try self.file.flush();
     }
 
-    // ============================================================
+    // ---------------------------------------------------------------
     // PUBLIC: OPEN TRADE
-    // ============================================================
+    // ---------------------------------------------------------------
     pub fn logOpenTrade(
         self: *TradeLogger,
         event_time: i128,
@@ -166,14 +167,12 @@ pub const TradeLogger = struct {
             0.0,
             pct_entry,
             0.0,
-        ) catch |err| {
-            std.log.err("Failed to log OPEN trade: {}", .{err});
-        };
+        ) catch {};
     }
 
-    // ============================================================
+    // ---------------------------------------------------------------
     // PUBLIC: CLOSE TRADE
-    // ============================================================
+    // ---------------------------------------------------------------
     pub fn logCloseTrade(
         self: *TradeLogger,
         event_time: i128,
@@ -216,8 +215,6 @@ pub const TradeLogger = struct {
             pnl_usdt,
             pct_entry,
             pct_exit,
-        ) catch |err| {
-            std.log.err("Failed to log CLOSE trade: {}", .{err});
-        };
+        ) catch {};
     }
 };
