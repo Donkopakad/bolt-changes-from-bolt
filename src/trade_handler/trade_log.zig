@@ -31,23 +31,21 @@ pub const TradeLogger = struct {
         try cwd.makePath("logs");
 
         var file: std.fs.File = cwd.openFile("logs/trades.csv", .{
-            .read = false,
-            .write = true,
-            .append = true,
-            .truncate = false,
+            .mode = .read_write,
+            .intended_io_mode = .blocking,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 var created = try cwd.createFile("logs/trades.csv", .{ .truncate = false });
                 created.close();
                 break :blk try cwd.openFile("logs/trades.csv", .{
-                    .read = false,
-                    .write = true,
-                    .append = true,
-                    .truncate = false,
+                    .mode = .read_write,
+                    .intended_io_mode = .blocking,
                 });
             },
             else => return err,
         };
+
+        try file.seekFromEnd(0);
 
         var logger = TradeLogger{
             .allocator = allocator,
@@ -73,6 +71,7 @@ pub const TradeLogger = struct {
 
     pub fn logOpenTrade(
         self: *TradeLogger,
+        event_time_ns: i128,
         symbol: []const u8,
         side: []const u8,
         leverage: f64,
@@ -80,8 +79,8 @@ pub const TradeLogger = struct {
         position_size_usdt: f64,
         fee_rate: f64,
         entry_price: f64,
-        candle_start_ns: i64,
-        candle_end_ns: i64,
+        candle_start_ns: i128,
+        candle_end_ns: i128,
         candle_open: f64,
         candle_high: f64,
         candle_low: f64,
@@ -89,7 +88,7 @@ pub const TradeLogger = struct {
         pct_entry: f64,
     ) !void {
         const row = TradeRow{
-            .event_time_ns = try nowNs(),
+            .event_time_ns = @as(i64, @intCast(event_time_ns)),
             .symbol = symbol,
             .side = side,
             .leverage = leverage,
@@ -98,8 +97,8 @@ pub const TradeLogger = struct {
             .fee_rate = fee_rate,
             .entry_price = entry_price,
             .exit_price = 0.0,
-            .candle_start_ns = candle_start_ns,
-            .candle_end_ns = candle_end_ns,
+            .candle_start_ns = @as(i64, @intCast(candle_start_ns)),
+            .candle_end_ns = @as(i64, @intCast(candle_end_ns)),
             .candle_open = candle_open,
             .candle_high = candle_high,
             .candle_low = candle_low,
@@ -114,22 +113,50 @@ pub const TradeLogger = struct {
 
     pub fn logCloseTrade(
         self: *TradeLogger,
-        base_row: TradeRow,
+        event_time_ns: i128,
+        symbol: []const u8,
+        side: []const u8,
+        leverage: f64,
+        amount: f64,
+        position_size_usdt: f64,
+        fee_rate: f64,
+        entry_price: f64,
         exit_price: f64,
+        candle_start_ns: i128,
+        candle_end_ns: i128,
+        candle_open: f64,
+        candle_high: f64,
+        candle_low: f64,
         candle_close_at_exit: f64,
         pnl_usdt: f64,
+        pct_entry: f64,
         pct_exit: f64,
     ) !void {
-        var row = base_row;
-        row.event_time_ns = try nowNs();
-        row.exit_price = exit_price;
-        row.candle_close_at_exit = candle_close_at_exit;
-        row.pnl_usdt = pnl_usdt;
-        row.pct_exit = pct_exit;
+        const row = TradeRow{
+            .event_time_ns = @as(i64, @intCast(event_time_ns)),
+            .symbol = symbol,
+            .side = side,
+            .leverage = leverage,
+            .amount = amount,
+            .position_size_usdt = position_size_usdt,
+            .fee_rate = fee_rate,
+            .entry_price = entry_price,
+            .exit_price = exit_price,
+            .candle_start_ns = @as(i64, @intCast(candle_start_ns)),
+            .candle_end_ns = @as(i64, @intCast(candle_end_ns)),
+            .candle_open = candle_open,
+            .candle_high = candle_high,
+            .candle_low = candle_low,
+            .candle_close_at_entry = candle_open,
+            .candle_close_at_exit = candle_close_at_exit,
+            .pnl_usdt = pnl_usdt,
+            .pct_entry = pct_entry,
+            .pct_exit = pct_exit,
+        };
         try self.writeTradeRow("close", row);
     }
 
-    fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !void {
+fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !void {
         var buffer: [64]u8 = undefined;
         const event_time = try formatTimestamp(row.event_time_ns, &buffer);
 
@@ -168,11 +195,6 @@ pub const TradeLogger = struct {
         try self.file.flush();
     }
 };
-
-fn nowNs() !i64 {
-    var ts = try std.time.Instant.now();
-    return @intCast(i64, ts.timestamp());
-}
 
 fn formatTimestamp(ns: i64, buffer: *[64]u8) ![]const u8 {
     const seconds: i64 = @divTrunc(ns, 1_000_000_000);
