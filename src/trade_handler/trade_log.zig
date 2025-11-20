@@ -5,7 +5,8 @@ pub const TradeLogger = struct {
     file: std.fs.File,
 
     pub const TradeRow = struct {
-        event_time_ns: i64,
+        event_time_ns: i128,
+        event_type: []const u8,
         symbol: []const u8,
         side: []const u8,
         leverage: f64,
@@ -14,8 +15,8 @@ pub const TradeLogger = struct {
         fee_rate: f64,
         entry_price: f64,
         exit_price: f64,
-        candle_start_ns: i64,
-        candle_end_ns: i64,
+        candle_start_ns: i128,
+        candle_end_ns: i128,
         candle_open: f64,
         candle_high: f64,
         candle_low: f64,
@@ -26,26 +27,30 @@ pub const TradeLogger = struct {
         pct_exit: f64,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !TradeLogger {
-        const cwd = std.fs.cwd();
-        try cwd.makePath("logs");
+    pub fn init(allocator: std.mem.Allocator) !*TradeLogger {
+        try std.fs.cwd().makePath("logs");
 
-        var file: std.fs.File = cwd.openFile("logs/trades.csv", .{
-            .mode = .read_write,
+        const file = std.fs.cwd().openFile("logs/trades.csv", .{
+            .read = false,
+            .write = true,
+            .append = true,
+            .truncate = false,
         }) catch |err| switch (err) {
             error.FileNotFound => blk: {
-                var created = try cwd.createFile("logs/trades.csv", .{ .truncate = false });
+                const created = try std.fs.cwd().createFile("logs/trades.csv", .{ .truncate = false });
                 created.close();
-                break :blk try cwd.openFile("logs/trades.csv", .{
-                    .mode = .read_write,
+                break :blk try std.fs.cwd().openFile("logs/trades.csv", .{
+                    .read = false,
+                    .write = true,
+                    .append = true,
+                    .truncate = false,
                 });
             },
             else => return err,
         };
 
-        try file.seekFromEnd(0);
-
-        var logger = TradeLogger{
+        const logger = try allocator.create(TradeLogger);
+        logger.* = TradeLogger{
             .allocator = allocator,
             .file = file,
         };
@@ -86,7 +91,8 @@ pub const TradeLogger = struct {
         pct_entry: f64,
     ) !void {
         const row = TradeRow{
-            .event_time_ns = @as(i64, @intCast(event_time_ns)),
+            .event_time_ns = event_time_ns,
+            .event_type = "open",
             .symbol = symbol,
             .side = side,
             .leverage = leverage,
@@ -95,8 +101,8 @@ pub const TradeLogger = struct {
             .fee_rate = fee_rate,
             .entry_price = entry_price,
             .exit_price = 0.0,
-            .candle_start_ns = @as(i64, @intCast(candle_start_ns)),
-            .candle_end_ns = @as(i64, @intCast(candle_end_ns)),
+            .candle_start_ns = candle_start_ns,
+            .candle_end_ns = candle_end_ns,
             .candle_open = candle_open,
             .candle_high = candle_high,
             .candle_low = candle_low,
@@ -106,7 +112,7 @@ pub const TradeLogger = struct {
             .pct_entry = pct_entry,
             .pct_exit = 0.0,
         };
-        try self.writeTradeRow("open", row);
+        try self.writeTradeRow(row);
     }
 
     pub fn logCloseTrade(
@@ -131,7 +137,8 @@ pub const TradeLogger = struct {
         pct_exit: f64,
     ) !void {
         const row = TradeRow{
-            .event_time_ns = @as(i64, @intCast(event_time_ns)),
+            .event_time_ns = event_time_ns,
+            .event_type = "close",
             .symbol = symbol,
             .side = side,
             .leverage = leverage,
@@ -140,8 +147,8 @@ pub const TradeLogger = struct {
             .fee_rate = fee_rate,
             .entry_price = entry_price,
             .exit_price = exit_price,
-            .candle_start_ns = @as(i64, @intCast(candle_start_ns)),
-            .candle_end_ns = @as(i64, @intCast(candle_end_ns)),
+            .candle_start_ns = candle_start_ns,
+            .candle_end_ns = candle_end_ns,
             .candle_open = candle_open,
             .candle_high = candle_high,
             .candle_low = candle_low,
@@ -151,25 +158,25 @@ pub const TradeLogger = struct {
             .pct_entry = pct_entry,
             .pct_exit = pct_exit,
         };
-        try self.writeTradeRow("close", row);
+        try self.writeTradeRow(row);
     }
 
-    fn writeTradeRow(self: *TradeLogger, event_type: []const u8, row: TradeRow) !void {
-        var buffer: [64]u8 = undefined;
-        const event_time = try formatTimestamp(row.event_time_ns, &buffer);
+    pub fn writeTradeRow(self: *TradeLogger, row: TradeRow) !void {
+        var time_buf: [64]u8 = undefined;
+        const event_time = try formatTimestamp(row.event_time_ns, &time_buf);
 
-        var candle_buf_start: [64]u8 = undefined;
-        const candle_start = try formatTimestamp(row.candle_start_ns, &candle_buf_start);
+        var candle_start_buf: [64]u8 = undefined;
+        const candle_start = try formatTimestamp(row.candle_start_ns, &candle_start_buf);
 
-        var candle_buf_end: [64]u8 = undefined;
-        const candle_end = try formatTimestamp(row.candle_end_ns, &candle_buf_end);
+        var candle_end_buf: [64]u8 = undefined;
+        const candle_end = try formatTimestamp(row.candle_end_ns, &candle_end_buf);
 
         const writer = self.file.writer();
         try writer.print(
             "{s},{s},{s},{s},{d:.4},{d:.4},{d:.4},{d:.6},{d:.4},{d:.4},{s},{s},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4},{d:.4}\n",
             .{
                 event_time,
-                event_type,
+                row.event_type,
                 row.symbol,
                 row.side,
                 row.leverage,
@@ -192,11 +199,14 @@ pub const TradeLogger = struct {
         );
         try self.file.flush();
     }
-
-    fn formatTimestamp(ns: i64, buffer: *[64]u8) ![]const u8 {
-        return try std.fmt.bufPrint(buffer, "{d}", .{ns});
-    }
 };
 
-fn formatTimestamp(ns: i64, buffer: *[64]u8) ![]const u8 {
-    return try std.fmt.bufPrint(buffer, "{d}", .{ns});
+pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
+    const secs: i128 = @divTrunc(timestamp_ns, 1_000_000_000);
+    const dt = try std.time.utcToDateTime(@as(i64, @intCast(secs)));
+    return try std.fmt.bufPrint(
+        buffer,
+        "{d:04}-{d:02}-{d:02}T{d:02}:{d:02}:{d:02}Z",
+        .{ dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second },
+    );
+}
