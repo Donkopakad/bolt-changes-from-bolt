@@ -1,16 +1,16 @@
 const std = @import("std");
 
-// ============================================================================
+// =============================================================================
 // Trade Logger
-// ============================================================================
+// =============================================================================
 
 pub const TradeLogger = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
 
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // TradeRow structure
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     pub const TradeRow = struct {
         event_time_ns: i128,
         event_type: []const u8,
@@ -34,33 +34,27 @@ pub const TradeLogger = struct {
         pct_exit: f64,
     };
 
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Initialize logger
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     pub fn init(allocator: std.mem.Allocator) !*TradeLogger {
-        // ensure directory exists
         try std.fs.cwd().makePath("logs");
 
         const path = "logs/trades.csv";
-
-        // open file in read_write (Zig 0.14 supports only .mode & .lock)
         var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try std.fs.cwd().createFile(path, .{}),
             else => return err,
         };
 
-        // determine if the file is new/empty and seek to end for appends
         const end_pos = try file.getEndPos();
         try file.seekTo(end_pos);
 
-        // allocate logger
         const logger = try allocator.create(TradeLogger);
         logger.* = .{
             .allocator = allocator,
             .file = file,
         };
 
-        // check if header needed
         if (end_pos == 0) {
             try logger.writeHeader();
         }
@@ -73,9 +67,9 @@ pub const TradeLogger = struct {
         self.allocator.destroy(self);
     }
 
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Header Writer
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     fn writeHeader(self: *TradeLogger) !void {
         const header =
             "event_time_utc,event_type,symbol,side,leverage,amount,position_size_usdt,"
@@ -87,9 +81,9 @@ pub const TradeLogger = struct {
         try self.file.flush();
     }
 
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // PUBLIC: Log OPEN trade
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     pub fn logOpenTrade(
         self: *TradeLogger,
         event_time_ns: i128,
@@ -133,9 +127,9 @@ pub const TradeLogger = struct {
         try self.writeTradeRow(row);
     }
 
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // PUBLIC: Log CLOSE trade
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     pub fn logCloseTrade(
         self: *TradeLogger,
         event_time_ns: i128,
@@ -182,9 +176,9 @@ pub const TradeLogger = struct {
         try self.writeTradeRow(row);
     }
 
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Write a single CSV row
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     fn writeTradeRow(self: *TradeLogger, row: TradeRow) !void {
         var buf1: [64]u8 = undefined;
         var buf2: [64]u8 = undefined;
@@ -226,11 +220,9 @@ pub const TradeLogger = struct {
     }
 };
 
-// ============================================================================
+// =============================================================================
 // Timestamp formatter — Zig 0.14.0 compatible
-// ============================================================================
+// =============================================================================
 pub fn formatTimestamp(timestamp_ns: i128, buffer: *[64]u8) ![]const u8 {
     const secs: i128 = @divFloor(timestamp_ns, 1_000_000_000);
-
-    // Avoid relying on removed std.time conversion helpers; log epoch seconds.
     return try std.fmt.bufPrint(buffer, "{d}", .{secs});
